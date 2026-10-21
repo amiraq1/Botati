@@ -37,4 +37,14 @@ object SystemPromptBuilder {
             .replace("<tool_result>", "<tool_result_escaped>")
         return "<tool_result>\n$escaped\n</tool_result>"
     }
+
+    /** Ensures tool result is enclosed in <tool_result> wrapper, without double wrapping (F-14). */
+    fun ensureWrappedToolResult(raw: String): String {
+        val trimmed = raw.trim()
+        return if (trimmed.startsWith("<tool_result>") && trimmed.endsWith("</tool_result>")) {
+            raw
+        } else {
+            wrapToolResult(raw)
+        }
+    }
 }

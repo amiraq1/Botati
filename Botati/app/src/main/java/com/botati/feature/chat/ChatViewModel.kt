@@ -23,6 +23,10 @@ import com.botati.domain.agent.AuditRecord
 import com.botati.domain.agent.EngineEvent
 import com.botati.domain.agent.LlmMessage
 import com.botati.domain.agent.SystemPromptBuilder
+import com.botati.domain.agent.TaskStateTransitions
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 import com.botati.domain.policy.BotPolicyProfile
 import com.botati.domain.policy.PolicyDecision
 import com.botati.domain.policy.ReasonCode
@@ -123,6 +127,9 @@ class ChatViewModel(
 
     // ---- approvals ---------------------------------------------------------
 
+    // F-17: session-only disclosure consent remembered in memory, not permanently in DB
+    private val sessionApprovedDisclosures = mutableSetOf<String>()
+
     private val approvalPort = object : ApprovalPort {
         override suspend fun requestApproval(call: ToolCall, decision: PolicyDecision): Boolean {
             val completer = CompletableDeferred<Boolean>()
@@ -140,8 +147,8 @@ class ChatViewModel(
             if (answer && decision is PolicyDecision.Ask &&
                 decision.reasonCode == ReasonCode.DISCLOSURE_ASK
             ) {
-                // §18: disclosure consent is remembered per source.
-                bots.grantApproval(botId, "disclose:" + (call.target ?: call.name))
+                // F-17: In-memory session consent only
+                sessionApprovedDisclosures.add("disclose:" + (call.target ?: call.name))
             }
             return answer
         }
@@ -209,7 +216,7 @@ class ChatViewModel(
                 val profile = BotPolicyProfile(
                     botId = b.id,
                     allowedTools = decodeStringList(b.allowedToolsJson).toSet(),
-                    preApprovedDisclosures = bots.approvalKeys(b.id).toSet(),
+                    preApprovedDisclosures = sessionApprovedDisclosures.toSet(),
                 )
                 val router = ToolRouter(
                     botId = b.id,
@@ -238,7 +245,8 @@ class ChatViewModel(
                         llmMessages += lm
                     } else if (lm.role == "tool") {
                         val id = if (pendingIds.isEmpty()) null else pendingIds.removeFirst()
-                        llmMessages += lm.copy(toolCallId = id)
+                        val wrapped = SystemPromptBuilder.ensureWrappedToolResult(lm.content)
+                        llmMessages += lm.copy(content = wrapped, toolCallId = id)
                     } else {
                         llmMessages += lm
                     }
@@ -259,9 +267,12 @@ class ChatViewModel(
                     statusLine.value = "خطأ: ${e.message}"
                 }
             } finally {
-                running.value = false
-                streamingText.value = ""
-                finishTaskIfNeeded()
+                // F-04: NonCancellable cleanup ensures status updates and FGS stop execute
+                withContext(NonCancellable) {
+                    running.value = false
+                    streamingText.value = ""
+                    finishTaskIfNeeded(wasCancelled = runJob?.isCancelled == true)
+                }
             }
         }
     }
@@ -282,9 +293,11 @@ class ChatViewModel(
             }
             is EngineEvent.ToolStarted -> { toolsUsed += ev.call.name; runSteps++ }
             is EngineEvent.ToolFinished -> {
+                // F-14: Save tool result wrapped in <tool_result>
                 bots.addMessage(
                     MessageEntity(
-                        conversationId = cid, role = "tool", content = ev.result,
+                        conversationId = cid, role = "tool",
+                        content = SystemPromptBuilder.ensureWrappedToolResult(ev.result),
                         toolName = ev.call.name, createdAt = now(),
                     ),
                 )
@@ -313,22 +326,48 @@ class ChatViewModel(
                     bots.upsertTask(updated); activeTask.value = updated
                 }
             }
-            is EngineEvent.Failed -> statusLine.value = "فشل: ${ev.message}"
+            is EngineEvent.Failed -> {
+                // F-18: Failed writes FAILED and saves error report
+                statusLine.value = "فشل: ${ev.message}"
+                activeTask.value?.let { t ->
+                    val updated = t.copy(
+                        status = "FAILED",
+                        stepsUsed = runSteps,
+                        costUsed = runCost,
+                        finalReport = buildReport("فشلت المهمة: ${ev.message}"),
+                    )
+                    bots.upsertTask(updated)
+                    activeTask.value = updated
+                }
+            }
             is EngineEvent.Done -> Unit
         }
     }
 
-    private suspend fun finishTaskIfNeeded() {
+    private suspend fun finishTaskIfNeeded(wasCancelled: Boolean) {
         val task = activeTask.value ?: return
-        if (task.status == "RUNNING") {
+        val finalStatus = TaskStateTransitions.resolveTerminalStatus(
+            currentStatus = task.status,
+            wasCancelled = wasCancelled,
+        )
+        // F-18 & F-04: Only update if RUNNING or if terminal status needs to be applied
+        if (task.status == "RUNNING" || (wasCancelled && task.status != "STOPPED" && task.status !in TaskStateTransitions.TERMINAL_STATES)) {
+            val reportReason = when (finalStatus) {
+                "FAILED" -> "فشلت المهمة."
+                "STOPPED" -> "توقّفت المهمة (إلغاء)."
+                "STOPPED_LIMIT" -> "توقفت عند الحد الأقصى."
+                else -> "اكتملت."
+            }
             val updated = task.copy(
-                status = "DONE", stepsUsed = runSteps, costUsed = runCost,
-                finalReport = buildReport("اكتملت."),
+                status = finalStatus,
+                stepsUsed = runSteps,
+                costUsed = runCost,
+                finalReport = buildReport(reportReason),
             )
             bots.upsertTask(updated)
             activeTask.value = updated
         }
-        if (activeTask.value?.status in listOf("DONE", "STOPPED_LIMIT", "CANCELLED")) {
+        if (activeTask.value?.status in TaskStateTransitions.TERMINAL_STATES) {
             TaskForegroundService.stop(app)
         }
     }
@@ -448,17 +487,24 @@ class ChatViewModel(
 
     // ---- mapping ---------------------------------------------------------------
 
-    private fun MessageEntity.toLlm(): LlmMessage = LlmMessage(
-        role = role,
-        content = content,
-        toolCalls = toolCallsJson?.let { raw ->
-            try {
-                json.decodeFromString<List<AssembledToolCall>>(raw)
-            } catch (e: Exception) { emptyList() }
-        } ?: emptyList(),
-        toolCallId = toolCallId,
-        name = toolName,
-    )
+    private fun MessageEntity.toLlm(): LlmMessage {
+        val finalContent = if (role == "tool") {
+            SystemPromptBuilder.ensureWrappedToolResult(content)
+        } else {
+            content
+        }
+        return LlmMessage(
+            role = role,
+            content = finalContent,
+            toolCalls = toolCallsJson?.let { raw ->
+                try {
+                    json.decodeFromString<List<AssembledToolCall>>(raw)
+                } catch (e: Exception) { emptyList() }
+            } ?: emptyList(),
+            toolCallId = toolCallId,
+            name = toolName,
+        )
+    }
 
     private fun encodeToolCalls(calls: List<AssembledToolCall>): String =
         json.encodeToString(calls)
