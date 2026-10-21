@@ -54,15 +54,18 @@ object ToolRegistry {
         ),
     )
 
-    /** Canonical mail-tool classifications (§18 corrected values). */
-    fun mailTool(plainName: String): ToolMeta? = when (plainName) {
-        "list_unread", "search_emails", "read_email" ->
-            ToolMeta(plainName, Effect.E0, Disclosure.D2, ToolSource.MCP)
-        "draft_reply" ->
-            ToolMeta(plainName, Effect.E1, Disclosure.D2, ToolSource.MCP)
-        "send_reply" ->
-            ToolMeta(plainName, Effect.E3, Disclosure.D2, ToolSource.MCP)
-        else -> null
+    /** Canonical mail-tool classifications (§18 corrected values). Only for trusted mail server (F-10). */
+    fun mailTool(plainName: String, isTrustedServer: Boolean = false): ToolMeta? {
+        if (!isTrustedServer) return null
+        return when (plainName) {
+            "list_unread", "search_emails", "read_email" ->
+                ToolMeta(plainName, Effect.E0, Disclosure.D2, ToolSource.MCP)
+            "draft_reply" ->
+                ToolMeta(plainName, Effect.E1, Disclosure.D2, ToolSource.MCP)
+            "send_reply" ->
+                ToolMeta(plainName, Effect.E3, Disclosure.D2, ToolSource.MCP)
+            else -> null
+        }
     }
 
     /**

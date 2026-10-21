@@ -45,6 +45,10 @@ class MinimalMcpClient(
     private val tokenProvider: suspend () -> String?,
 ) : McpClientPort {
 
+    init {
+        validateUrl(url)
+    }
+
     private val json = Json { ignoreUnknownKeys = true }
     private val mutex = Mutex()
     private var nextId = 1
@@ -230,6 +234,10 @@ class MinimalMcpClient(
     }
 
     companion object {
+        fun validateUrl(url: String) {
+            require(url.startsWith("https://")) { "Only https:// URLs are permitted: $url" }
+        }
+
         /**
          * Parses a Streamable-HTTP response body, which may be plain JSON or
          * an SSE stream of `data:` lines. Picks the JSON-RPC object whose id

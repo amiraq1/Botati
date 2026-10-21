@@ -21,6 +21,7 @@ import com.botati.domain.policy.ToolSource
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -132,16 +133,34 @@ class PolicyEngineTest {
         assertEquals(PolicyDecision.Deny(ReasonCode.NOT_ALLOWED), d)
     }
 
-    @Test fun chat_searchWithPrivatePayload_elevatesToD2_andAsks() {
+    // F-06: privatePayload in arguments is ignored. Network after D2 contamination elevates to D2 and asks.
+    @Test fun chat_networkAfterD2Contamination_elevatesToD2_andAsks() {
+        val call = ToolCall(
+            "web_search",
+            arguments = buildJsonObject { put("query", "x"); put("privatePayload", false) },
+        )
+        // Even with privatePayload = false in arguments, d2Contaminated = true elevates to D2 and asks
+        val d = PolicyEngine.decide(
+            bot(setOf("web_search")), call,
+            meta("web_search", Effect.E0, Disclosure.D1), Session.Chat,
+            Counters(d2Contaminated = true), now,
+        )
+        assertEquals(PolicyDecision.Ask(ReasonCode.DISCLOSURE_ASK), d)
+    }
+
+    // F-06: privatePayload alone without session contamination does NOT elevate to D2
+    @Test fun chat_privatePayloadArgumentAlone_isIgnored_doesNotElevateWithoutContamination() {
         val call = ToolCall(
             "web_search",
             arguments = buildJsonObject { put("query", "x"); put("privatePayload", true) },
         )
         val d = PolicyEngine.decide(
             bot(setOf("web_search")), call,
-            meta("web_search", Effect.E0, Disclosure.D1), Session.Chat, Counters(), now,
+            meta("web_search", Effect.E0, Disclosure.D1), Session.Chat,
+            Counters(d2Contaminated = false), now,
         )
-        assertEquals(PolicyDecision.Ask(ReasonCode.DISCLOSURE_ASK), d)
+        // Without D2 contamination, web_search in chat allows public read; privatePayload argument is ignored
+        assertEquals(PolicyDecision.Allow(ReasonCode.CHAT_READ), d)
     }
 
     // ---------- task ----------
@@ -258,6 +277,49 @@ class PolicyEngineTest {
         val d = PolicyEngine.decide(
             bot(emptySet()), ToolCall("ext__do_thing"), unknown,
             Session.Task(contract()), Counters(), now,
+        )
+        assertEquals(PolicyDecision.Deny(ReasonCode.NOT_ALLOWED), d)
+    }
+
+    // F-03: Empty targets list must reject/pause if action is above read
+    @Test fun task_replyAndSend_emptyThreadIds_doesNotAllow() {
+        val call = ToolCall(
+            "mail__send_reply",
+            targetKind = TargetKind.THREAD,
+            target = "t1",
+        )
+        val c = contract(targets = ContractTargets(threadIds = emptyList())).copy(
+            verb = ContractVerb.REPLY_AND_SEND,
+        )
+        val d = PolicyEngine.decide(
+            bot(setOf("mail__send_reply")), call,
+            meta("mail__send_reply", Effect.E3, Disclosure.D2),
+            Session.Task(c), Counters(), now,
+        )
+        assertNotEquals(PolicyDecision.Allow(ReasonCode.IN_CONTRACT), d)
+        assertTrue("Empty targets list must pause on REPLY_AND_SEND", d is PolicyDecision.Pause)
+        assertEquals(ReasonCode.TARGET_MISMATCH, (d as PolicyDecision.Pause).reasonCode)
+    }
+
+    // F-06: web_fetch must not pass silently in chat
+    @Test fun chat_webFetch_inChat_asks_neverSilentAllow() {
+        val call = ToolCall("web_fetch", targetKind = TargetKind.URL, target = "https://example.com")
+        val d = PolicyEngine.decide(
+            bot(setOf("web_fetch")), call,
+            meta("web_fetch", Effect.E0, Disclosure.D1),
+            Session.Chat, Counters(), now,
+        )
+        assertNotEquals(PolicyDecision.Allow(ReasonCode.CHAT_READ), d)
+        assertTrue(d is PolicyDecision.Ask)
+    }
+
+    // F-07: http:// URLs must be denied
+    @Test fun policy_rejectsHttpUrlTarget() {
+        val call = ToolCall("web_fetch", targetKind = TargetKind.URL, target = "http://insecure.example.com")
+        val d = PolicyEngine.decide(
+            bot(setOf("web_fetch")), call,
+            meta("web_fetch", Effect.E0, Disclosure.D1),
+            Session.Chat, Counters(), now,
         )
         assertEquals(PolicyDecision.Deny(ReasonCode.NOT_ALLOWED), d)
     }

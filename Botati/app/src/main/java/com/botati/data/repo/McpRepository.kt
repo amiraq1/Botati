@@ -42,11 +42,13 @@ class McpRepository(private val db: BotatiDatabase) {
     }
 
     /** Persists a tools/list sync with classifications (§18): canonical mail
-     *  values by plain name; anything else starts at the E3/D2 default. */
-    suspend fun saveSyncedTools(server: McpServerEntity, tools: List<McpRemoteTool>) {
+     *  values by plain name only for the trusted mail server (F-10);
+     *  anything else starts at the E3/D2 default. */
+    suspend fun saveSyncedTools(server: McpServerEntity, tools: List<McpRemoteTool>, trustedMailServerId: String? = null) {
         db.mcpDao().deleteToolsForServer(server.id)
+        val isTrusted = trustedMailServerId != null && server.id == trustedMailServerId
         for (t in tools) {
-            val canonical = ToolRegistry.mailTool(t.name)
+            val canonical = ToolRegistry.mailTool(t.name, isTrusted)
             db.mcpDao().insertTool(
                 McpToolEntity(
                     serverId = server.id,

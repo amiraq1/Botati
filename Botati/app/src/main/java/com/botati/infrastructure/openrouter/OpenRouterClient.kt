@@ -56,9 +56,10 @@ fun createHttpClient(): HttpClient = HttpClient(CIO) {
         connectTimeoutMillis = 15_000
         socketTimeoutMillis = 120_000
     }
-    // Release builds: no HTTP logging at all (§0). Debug: redacted headers only.
+    // Release builds: no HTTP logging at all (§0).
+    // F-19: Never log HTTP headers (avoids logging Authorization tokens).
     if (BuildConfig.DEBUG) {
-        install(Logging) { logger = RedactingKtorLogger; level = LogLevel.HEADERS }
+        install(Logging) { logger = RedactingKtorLogger; level = LogLevel.INFO }
     }
     expectSuccess = false
 }

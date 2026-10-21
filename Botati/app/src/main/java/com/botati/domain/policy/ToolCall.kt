@@ -30,4 +30,5 @@ sealed interface Session {
 data class Counters(
     val stepsUsed: Int = 0,
     val costUsedUsd: Double = 0.0,
+    val d2Contaminated: Boolean = false,
 )
