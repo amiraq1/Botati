@@ -18,10 +18,10 @@ kotlinc \
   -cp "$CP" \
   -Xplugin="$KOTLIN_SERIALIZATION_PLUGIN" \
   -d "$TEST_CLASSES" \
-  $(find "$ROOT_DIR/Botati/app/src/main/java/com/botati/domain" -name '*.kt') \
-  "$ROOT_DIR/Botati/app/src/main/java/com/botati/infrastructure/mcp/McpClientPort.kt" \
-  "$ROOT_DIR/Botati/app/src/main/java/com/botati/infrastructure/mcp/MinimalMcpClient.kt" \
-  $(find "$ROOT_DIR/Botati/app/src/test/java" -name '*.kt')
+  $(find "$ROOT_DIR/app/src/main/java/com/botati/domain" -name '*.kt') \
+  "$ROOT_DIR/app/src/main/java/com/botati/infrastructure/mcp/McpClientPort.kt" \
+  "$ROOT_DIR/app/src/main/java/com/botati/infrastructure/mcp/MinimalMcpClient.kt" \
+  $(find "$ROOT_DIR/app/src/test/java" -name '*.kt')
 
 echo "==> Running JUnit tests..."
 CP_RUN=$(ls "$DEPS_DIR"/*.jar | grep -v "junit-platform-console-standalone" | paste -sd ":" -)
