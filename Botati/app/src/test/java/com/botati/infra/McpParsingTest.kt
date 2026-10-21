@@ -38,4 +38,10 @@ class McpParsingTest {
         assertNull(MinimalMcpClient.parseRpcPayload("", 1, json))
         assertNull(MinimalMcpClient.parseRpcPayload("not json", 1, json))
     }
+
+    // F-07: MinimalMcpClient must reject non-https URLs
+    @Test(expected = IllegalArgumentException::class)
+    fun rejectsHttpUrl() {
+        MinimalMcpClient.validateUrl("http://insecure.example.com")
+    }
 }

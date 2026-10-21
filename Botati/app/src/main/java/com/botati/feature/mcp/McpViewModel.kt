@@ -32,6 +32,10 @@ class McpViewModel(
             status.value = "الاسم والرابط مطلوبان."
             return
         }
+        if (!url.trim().startsWith("https://")) {
+            status.value = "الرابط يجب أن يبدأ بـ https://"
+            return
+        }
         viewModelScope.launch {
             busy.value = true
             val server = repo.addServer(name.trim(), url.trim())

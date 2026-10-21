@@ -3,6 +3,7 @@ package com.botati.domain.policy
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
 
 /**
  * The Policy Engine (spec §6.2 + §18 + §28). A PURE function: no network, no
@@ -25,12 +26,21 @@ object PolicyEngine {
         counters: Counters,
         nowMs: Long,
     ): PolicyDecision {
+        // 0) Reject non-https URLs across the board (F-07)
+        if (call.targetKind == TargetKind.URL && call.target != null && !call.target.startsWith("https://")) {
+            return PolicyDecision.Deny(ReasonCode.NOT_ALLOWED)
+        }
+        val argUrl = (call.arguments["url"] as? JsonPrimitive)?.contentOrNull
+        if (argUrl != null && !argUrl.startsWith("https://")) {
+            return PolicyDecision.Deny(ReasonCode.NOT_ALLOWED)
+        }
+
         // 1) The tool must be in the bot's allow-list at all.
         if (call.name !in bot.allowedTools) {
             return PolicyDecision.Deny(ReasonCode.NOT_ALLOWED)
         }
 
-        val disclosure = effectiveDisclosure(call, meta)
+        val disclosure = effectiveDisclosure(call, meta, counters.d2Contaminated)
 
         return when (session) {
             is Session.Chat -> decideChat(bot, call, meta, disclosure)
@@ -58,6 +68,9 @@ object PolicyEngine {
             if (key in bot.preApprovedDisclosures) PolicyDecision.Allow(ReasonCode.PRE_APPROVED)
             else PolicyDecision.Ask(ReasonCode.DISCLOSURE_ASK)
         }
+        // F-06: web_fetch must not pass silently in chat
+        call.name == "web_fetch" ->
+            PolicyDecision.Ask(ReasonCode.TIER_ASK)
         else -> PolicyDecision.Allow(ReasonCode.CHAT_READ)
     }
 
@@ -97,7 +110,7 @@ object PolicyEngine {
                 else ReasonCode.FORBIDDEN_ACTION,
             )
         }
-        if (!targetAllowed(call, contract)) {
+        if (!targetAllowed(call, contract, meta)) {
             return PolicyDecision.Pause(ReasonCode.TARGET_MISMATCH)
         }
         if (!recipientsAllowed(call, contract)) {
@@ -113,10 +126,13 @@ object PolicyEngine {
 
     // ---- helpers -----------------------------------------------------------
 
-    /** §18: a nominally-public query carrying private payload is D2. */
-    fun effectiveDisclosure(call: ToolCall, meta: ToolMeta): Disclosure {
-        val flag = (call.arguments["privatePayload"] as? JsonPrimitive)?.booleanOrNull
-        return if (flag == true) Disclosure.D2 else meta.disclosure
+    /** §18 + F-06: ignore privatePayload; after D2 result in context, network is D2. */
+    fun effectiveDisclosure(call: ToolCall, meta: ToolMeta, d2Contaminated: Boolean = false): Disclosure {
+        return if (d2Contaminated && (meta.disclosure >= Disclosure.D1 || meta.source == ToolSource.REMOTE_API)) {
+            Disclosure.D2
+        } else {
+            meta.disclosure
+        }
     }
 
     private fun forbiddenHit(call: ToolCall, contract: ScopeContract): ForbiddenAction? {
@@ -145,14 +161,19 @@ object PolicyEngine {
         return (count ?: 0) > 0
     }
 
-    private fun targetAllowed(call: ToolCall, contract: ScopeContract): Boolean {
+    private fun targetAllowed(call: ToolCall, contract: ScopeContract, meta: ToolMeta): Boolean {
         val targets = contract.targets
+        val isAboveRead = contract.verb > ContractVerb.READ_ONLY || meta.effect > Effect.E0
         return when (call.targetKind) {
             TargetKind.THREAD ->
-                targets.threadIds.isEmpty() || (call.target != null && call.target in targets.threadIds)
+                if (isAboveRead && targets.threadIds.isEmpty()) false
+                else targets.threadIds.isEmpty() || (call.target != null && call.target in targets.threadIds)
             TargetKind.FILE ->
-                targets.fileUris.isEmpty() || (call.target != null && call.target in targets.fileUris)
-            else -> true
+                if (isAboveRead && targets.fileUris.isEmpty()) false
+                else targets.fileUris.isEmpty() || (call.target != null && call.target in targets.fileUris)
+            else ->
+                if (isAboveRead && targets.threadIds.isEmpty() && targets.fileUris.isEmpty()) false
+                else true
         }
     }
 

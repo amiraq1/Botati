@@ -5,6 +5,7 @@
 Botati/app/build/
 Botati/build/
 Botati/.build-work/
+build-tests/
 .gradle/
 
 # Binary artifacts

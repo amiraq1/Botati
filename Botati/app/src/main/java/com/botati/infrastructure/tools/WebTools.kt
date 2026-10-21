@@ -42,6 +42,9 @@ class WebTools(
             ?: return """{"error":"missing query"}"""
         val count = ((args["count"] as? JsonPrimitive)?.intOrNull ?: 5).coerceIn(1, 10)
         val endpoint = settings.searchEndpoint.first()
+        if (!endpoint.startsWith("https://")) {
+            return """{"error":"only https search endpoints permitted"}"""
+        }
         val payload = buildJsonObject {
             put("api_key", key)
             put("query", query)
@@ -74,8 +77,8 @@ class WebTools(
     suspend fun fetch(args: JsonObject): String {
         val url = (args["url"] as? JsonPrimitive)?.contentOrNull
             ?: return """{"error":"missing url"}"""
-        if (!url.startsWith("http://") && !url.startsWith("https://")) {
-            return """{"error":"only http/https urls"}"""
+        if (!url.startsWith("https://")) {
+            return """{"error":"only https urls permitted"}"""
         }
         val resp = http.get(url) { header(HttpHeaders.UserAgent, "Botati/0.1") }
         if (resp.status.value !in 200..299) {

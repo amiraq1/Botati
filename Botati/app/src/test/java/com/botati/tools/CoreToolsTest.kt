@@ -5,6 +5,8 @@ import com.botati.domain.tools.IdempotencyKeys
 import com.botati.domain.tools.ToolRegistry
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -54,5 +56,18 @@ class CoreToolsTest {
     @Test fun maskForDisplay_showsLast4Only() {
         assertEquals("••••…cdef", SecretRedactor.maskForDisplay("sk-abcdef"))
         assertEquals("••••", SecretRedactor.maskForDisplay("ab"))
+    }
+
+    // F-10: mailTool() only for trusted mail server. Unknown server remains E3 (null canonical).
+    @Test fun mailTool_unknownServer_readEmail_remainsNull() {
+        val tool = ToolRegistry.mailTool("read_email", isTrustedServer = false)
+        assertNull(tool)
+    }
+
+    @Test fun mailTool_trustedServer_readEmail_isE0() {
+        val tool = ToolRegistry.mailTool("read_email", isTrustedServer = true)
+        assertNotNull(tool)
+        assertEquals(com.botati.domain.policy.Effect.E0, tool?.effect)
+        assertEquals(com.botati.domain.policy.Disclosure.D2, tool?.disclosure)
     }
 }

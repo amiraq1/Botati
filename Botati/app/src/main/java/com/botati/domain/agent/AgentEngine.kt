@@ -2,6 +2,7 @@ package com.botati.domain.agent
 
 import com.botati.domain.policy.BotPolicyProfile
 import com.botati.domain.policy.Counters
+import com.botati.domain.policy.Disclosure
 import com.botati.domain.policy.PolicyDecision
 import com.botati.domain.policy.PolicyEngine
 import com.botati.domain.policy.Session
@@ -71,6 +72,8 @@ class AgentEngine(
         val toolSpecs = registry.values
             .filter { it.name in profile.allowedTools }
             .map { LlmToolSpec(it.name, it.description, it.inputSchemaJson) }
+
+        var d2Contaminated = messages.any { it.role == "tool" && registry[it.name]?.disclosure == Disclosure.D2 }
 
         while (!finished) {
             currentCoroutineContext().ensureActive()
@@ -146,7 +149,11 @@ class AgentEngine(
                         }
                         consecutiveUnknown = 0
 
-                        val counters = Counters(stepsUsed = steps - 1, costUsedUsd = tracker.totalKnownCostUsd)
+                        val counters = Counters(
+                            stepsUsed = steps - 1,
+                            costUsedUsd = tracker.totalKnownCostUsd,
+                            d2Contaminated = d2Contaminated,
+                        )
                         val decision = PolicyEngine.decide(profile, call, meta, session, counters, nowMs())
                         audit.record(auditRecord(botId, taskId, call, meta, decisionName(decision), decision))
 
@@ -170,9 +177,13 @@ class AgentEngine(
                                     emit(EngineEvent.ToolFinished(call, result, true))
                                 } else {
                                     executeAndAppend(call, assembledCall, messages, emitEvent)
+                                    if (meta.disclosure == Disclosure.D2) d2Contaminated = true
                                 }
                             }
-                            is PolicyDecision.Allow -> executeAndAppend(call, assembledCall, messages, emitEvent)
+                            is PolicyDecision.Allow -> {
+                                executeAndAppend(call, assembledCall, messages, emitEvent)
+                                if (meta.disclosure == Disclosure.D2) d2Contaminated = true
+                            }
                         }
                         if (steps >= maxSteps && !finished) {
                             emit(EngineEvent.Stopped("step ceiling"))
