@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec §12/§0: vault ciphertext files never leave the device via backup.
+     (The vault is encrypted regardless; this is defense in depth.) -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="datastore/vault.preferences_pb" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="datastore/vault.preferences_pb" />
+    </device-transfer>
+</data-extraction-rules>

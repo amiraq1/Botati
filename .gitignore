@@ -1,0 +1,22 @@
+# Machine-local config (SDK paths differ per machine)
+**/local.properties
+
+# Build outputs
+Botati/app/build/
+Botati/build/
+Botati/.build-work/
+.gradle/
+
+# Binary artifacts
+*.apk
+*.aab
+*.idsig
+
+# Signing keys — never commit keystores
+*.keystore
+*.jks
+
+# IDE / OS
+.idea/
+*.iml
+.DS_Store
