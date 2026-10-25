@@ -14,7 +14,10 @@ import kotlinx.serialization.json.contentOrNull
  * design: scope is checked here, where it can be unit-tested.
  *
  * Precedence (§6.2): Deny → ceiling Stop → out-of-contract Pause →
- * chat tier Ask/Allow → Allow.
+ * chat tier Ask/Allow → Allow. A Pause approval grants that exact action
+ * once (§11.3/SEC-02): the grant overrides only the shown Pause reason,
+ * never NEW_RECIPIENT or FORBIDDEN_ACTION, and is consumed after the first
+ * execution under it.
  */
 object PolicyEngine {
 
@@ -97,40 +100,55 @@ object PolicyEngine {
             return PolicyDecision.Stop(ReasonCode.CONTRACT_EXPIRED)
         }
 
-        // 2b) §11.3: an action the user approved mid-run is treated as inside the
-        //     contract for this exact (tool, target) pair — otherwise approving it
-        //     would only move the wall one step and the next identical call would
-        //     ask again. Ceilings above still apply; this bypasses scope only.
-        if (GrantKey(call.name, call.target) in grants) {
-            return PolicyDecision.Allow(ReasonCode.GRANTED_ONCE)
-        }
-
-        // 3) Contract scope: tool, verb ceiling, forbidden actions, target,
-        //    recipients lock, disclosure scope.
-        if (call.name !in contract.allowedTools) {
-            return PolicyDecision.Pause(ReasonCode.TOOL_NOT_IN_CONTRACT)
-        }
-        if (meta.effect > contract.verb.maxEffect) {
-            return PolicyDecision.Pause(ReasonCode.ACTION_BEYOND_VERB)
-        }
-        forbiddenHit(call, contract)?.let { hit ->
-            return PolicyDecision.Pause(
-                if (hit == ForbiddenAction.NEW_RECIPIENT) ReasonCode.NEW_RECIPIENT
-                else ReasonCode.FORBIDDEN_ACTION,
-            )
-        }
-        if (!targetAllowed(call, contract, meta)) {
-            return PolicyDecision.Pause(ReasonCode.TARGET_MISMATCH)
-        }
-        if (!recipientsAllowed(call, contract)) {
-            return PolicyDecision.Pause(ReasonCode.NEW_RECIPIENT)
-        }
-        if (!disclosureAllowed(disclosure, contract)) {
-            return PolicyDecision.Pause(ReasonCode.DISCLOSURE_NOT_IN_CONTRACT)
+        // 3) Contract scope, evaluated FIRST: a grant may only override the
+        //    exact Pause reason the user was shown — never a forbidden action
+        //    or a new recipient, and never a different payload (SEC-02).
+        val pauseReason = scopePauseReason(call, meta, disclosure, contract)
+        if (pauseReason != null) {
+            if (pauseReason == ReasonCode.NEW_RECIPIENT || pauseReason == ReasonCode.FORBIDDEN_ACTION) {
+                return PolicyDecision.Pause(pauseReason)
+            }
+            if (GrantKey.forCall(call, pauseReason) in grants) {
+                return PolicyDecision.Allow(ReasonCode.GRANTED_ONCE)
+            }
+            return PolicyDecision.Pause(pauseReason)
         }
 
         // 5) Everything checked: execute (the caller writes the audit entry).
         return PolicyDecision.Allow(ReasonCode.IN_CONTRACT)
+    }
+
+    /**
+     * The single scope evaluation (§6.2 step 3). Returns the Pause reason, or
+     * null when the call is inside the contract. Kept as one function so the
+     * grant check and the plain check can never drift apart.
+     */
+    private fun scopePauseReason(
+        call: ToolCall,
+        meta: ToolMeta,
+        disclosure: Disclosure,
+        contract: ScopeContract,
+    ): ReasonCode? {
+        if (call.name !in contract.allowedTools) {
+            return ReasonCode.TOOL_NOT_IN_CONTRACT
+        }
+        if (meta.effect > contract.verb.maxEffect) {
+            return ReasonCode.ACTION_BEYOND_VERB
+        }
+        forbiddenHit(call, contract)?.let { hit ->
+            return if (hit == ForbiddenAction.NEW_RECIPIENT) ReasonCode.NEW_RECIPIENT
+            else ReasonCode.FORBIDDEN_ACTION
+        }
+        if (!targetAllowed(call, contract, meta)) {
+            return ReasonCode.TARGET_MISMATCH
+        }
+        if (!recipientsAllowed(call, contract)) {
+            return ReasonCode.NEW_RECIPIENT
+        }
+        if (!disclosureAllowed(disclosure, contract)) {
+            return ReasonCode.DISCLOSURE_NOT_IN_CONTRACT
+        }
+        return null
     }
 
     // ---- helpers -----------------------------------------------------------

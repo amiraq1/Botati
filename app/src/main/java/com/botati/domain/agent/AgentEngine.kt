@@ -3,8 +3,10 @@ package com.botati.domain.agent
 import com.botati.domain.policy.BotPolicyProfile
 import com.botati.domain.policy.Counters
 import com.botati.domain.policy.Disclosure
+import com.botati.domain.policy.GrantKey
 import com.botati.domain.policy.PolicyDecision
 import com.botati.domain.policy.PolicyEngine
+import com.botati.domain.policy.ReasonCode
 import com.botati.domain.policy.Session
 import com.botati.domain.policy.TargetKind
 import com.botati.domain.policy.ToolCall
@@ -179,13 +181,18 @@ class AgentEngine(
                                     messages += toolMessage(assembledCall, result)
                                     emit(EngineEvent.ToolFinished(call, result, true))
                                 } else {
-                                    // §11.3: the tap authorizes this action alone, for this
-                                    // task run. Without recording it the identical next call
-                                    // would Pause again and the approval would mean nothing.
-                                    if (decision is PolicyDecision.Pause) {
+                                    // §11.3/SEC-02: the tap authorizes this action alone,
+                                    // once. The grant is recorded for a later identical
+                                    // call and consumed after the first execution under
+                                    // it; NEW_RECIPIENT and FORBIDDEN_ACTION are never
+                                    // grantable, so no grant is recorded for them.
+                                    if (decision is PolicyDecision.Pause &&
+                                        decision.reasonCode != ReasonCode.NEW_RECIPIENT &&
+                                        decision.reasonCode != ReasonCode.FORBIDDEN_ACTION
+                                    ) {
                                         val s = activeSession
                                         if (s is Session.Task) {
-                                            activeSession = s.withGrant(call.name, call.target)
+                                            activeSession = s.withGrant(GrantKey.forCall(call, decision.reasonCode))
                                         }
                                     }
                                     executeAndAppend(call, assembledCall, messages, emitEvent)
@@ -194,6 +201,13 @@ class AgentEngine(
                             }
                             is PolicyDecision.Allow -> {
                                 executeAndAppend(call, assembledCall, messages, emitEvent)
+                                // SEC-02: a grant is honored once — consume it after
+                                // the first execution that ran under it, so the next
+                                // identical call Pauses again.
+                                if (decision.reasonCode == ReasonCode.GRANTED_ONCE) {
+                                    val s = activeSession
+                                    if (s is Session.Task) activeSession = s.withoutGrantFor(call)
+                                }
                                 if (meta.disclosure == Disclosure.D2) d2Contaminated = true
                             }
                         }

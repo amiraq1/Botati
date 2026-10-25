@@ -20,8 +20,9 @@ enum class ReasonCode {
 
     /**
      * The call is outside the contract but the user approved this exact
-     * (tool, target) pair during the run (§11.3). Not a contract change:
-     * the grant lives in memory for this task only.
+     * (tool, target, arguments, Pause reason) during the run (§11.3/SEC-02).
+     * One-shot: the grant is consumed after the first execution under it.
+     * Not a contract change: the grant lives in memory for this task only.
      */
     GRANTED_ONCE,
 }
@@ -29,7 +30,7 @@ enum class ReasonCode {
 /**
  * The five distinct decisions (§6.2). They are NOT folded into one another:
  * Pause (task, out of contract) adds the approved action to the *session's*
- * one-action grants for the rest of this task run — the approved contract itself
+ * one-action grants for one execution only — the approved contract itself
  * is never mutated, so its hash keeps meaning what the user saw; Ask (chat) is a
  * one-off consent; Stop ends the task on a ceiling.
  */

@@ -14,9 +14,15 @@ import com.botati.domain.agent.RawUsage
 import com.botati.domain.agent.ToolCallDelta
 import com.botati.domain.agent.ToolExecutorPort
 import com.botati.domain.policy.BotPolicyProfile
+import com.botati.domain.policy.ContractTargets
+import com.botati.domain.policy.ContractVerb
+import com.botati.domain.policy.DataDisclosureScope
 import com.botati.domain.policy.Disclosure
 import com.botati.domain.policy.Effect
+import com.botati.domain.policy.ForbiddenAction
 import com.botati.domain.policy.PolicyDecision
+import com.botati.domain.policy.RecipientLock
+import com.botati.domain.policy.ScopeContract
 import com.botati.domain.policy.Session
 import com.botati.domain.policy.ToolCall
 import com.botati.domain.policy.ToolMeta
@@ -206,5 +212,47 @@ class AgentEngineTest {
         val executed = exec.calls.map { it.name }
         assertTrue("read_file should have been executed", executed.contains("read_file"))
         assertFalse("web_fetch must NOT be executed silently after read_file", executed.contains("web_fetch"))
+    }
+
+    // SEC-02: a Pause approval grants the exact action once — the approved
+    // execution plus one identical repeat; the second repeat Pauses again.
+    @Test fun pauseApproval_grantsOneRepeatThenPausesAgain() = runBlocking {
+        val contract = ScopeContract(
+            taskId = "task1",
+            verb = ContractVerb.REPLY_AND_SEND,
+            allowedTools = listOf("mail__read_email"),
+            targets = ContractTargets(
+                threadIds = listOf("t1"),
+                threadParticipantIds = listOf("alice@x.com"),
+                originalSenderId = "alice@x.com",
+            ),
+            dataDisclosure = DataDisclosureScope.PRIVATE_TO_LLM,
+            recipientsLock = RecipientLock.THREAD_PARTICIPANTS_ONLY,
+            forbidden = listOf(ForbiddenAction.FORWARD, ForbiddenAction.NEW_RECIPIENT),
+            maxSteps = 25,
+            budgetUsd = 0.30,
+            expiresAtMs = null,
+        )
+        val args = """{"threadId":"t1","body":"hello"}"""
+        val llm = FakeLlm(
+            toolScript("mail__send_reply", args),
+            toolScript("mail__send_reply", args),
+            toolScript("mail__send_reply", args),
+            textScript("done"),
+        )
+        val exec = FakeExecutor(); val audit = ListAudit(); val appr = FakeApprovals(true)
+        val registry = mapOf("mail__send_reply" to meta("mail__send_reply", Effect.E3, Disclosure.D2))
+        val events = engine(llm, exec, appr, audit).run(
+            "bot1", "m", 0.7,
+            BotPolicyProfile("bot1", setOf("mail__send_reply", "mail__read_email")),
+            registry,
+            baseMessages,
+            Session.Task(contract),
+        ).toList()
+        assertEquals(3, exec.calls.size)
+        assertEquals(listOf("PAUSE", "ALLOW", "PAUSE"), audit.records.map { it.decision })
+        assertEquals(2, events.count { it is EngineEvent.Paused })
+        assertEquals(2, appr.asked)
+        assertTrue(events.last() is EngineEvent.Done)
     }
 }
