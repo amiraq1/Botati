@@ -3,6 +3,7 @@ package com.botati.domain.agent
 import com.botati.domain.policy.BotPolicyProfile
 import com.botati.domain.policy.Counters
 import com.botati.domain.policy.Disclosure
+import com.botati.domain.policy.Effect
 import com.botati.domain.policy.GrantKey
 import com.botati.domain.policy.PolicyDecision
 import com.botati.domain.policy.PolicyEngine
@@ -185,10 +186,12 @@ class AgentEngine(
                                     // once. The grant is recorded for a later identical
                                     // call and consumed after the first execution under
                                     // it; NEW_RECIPIENT and FORBIDDEN_ACTION are never
-                                    // grantable, so no grant is recorded for them.
+                                    // grantable, and neither is any irreversible (E3)
+                                    // action — sends and deletes always Pause again.
                                     if (decision is PolicyDecision.Pause &&
                                         decision.reasonCode != ReasonCode.NEW_RECIPIENT &&
-                                        decision.reasonCode != ReasonCode.FORBIDDEN_ACTION
+                                        decision.reasonCode != ReasonCode.FORBIDDEN_ACTION &&
+                                        meta.effect != Effect.E3
                                     ) {
                                         val s = activeSession
                                         if (s is Session.Task) {

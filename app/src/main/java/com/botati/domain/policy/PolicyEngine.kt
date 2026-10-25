@@ -16,8 +16,8 @@ import kotlinx.serialization.json.contentOrNull
  * Precedence (§6.2): Deny → ceiling Stop → out-of-contract Pause →
  * chat tier Ask/Allow → Allow. A Pause approval grants that exact action
  * once (§11.3/SEC-02): the grant overrides only the shown Pause reason,
- * never NEW_RECIPIENT or FORBIDDEN_ACTION, and is consumed after the first
- * execution under it.
+ * never NEW_RECIPIENT or FORBIDDEN_ACTION, never an irreversible (E3)
+ * action, and is consumed after the first execution under it.
  */
 object PolicyEngine {
 
@@ -105,7 +105,12 @@ object PolicyEngine {
         //    or a new recipient, and never a different payload (SEC-02).
         val pauseReason = scopePauseReason(call, meta, disclosure, contract)
         if (pauseReason != null) {
-            if (pauseReason == ReasonCode.NEW_RECIPIENT || pauseReason == ReasonCode.FORBIDDEN_ACTION) {
+            // Owner decision 2026-10-25: grants never cover irreversible (E3)
+            // actions — a send or delete is never repeated on a tap, even when
+            // the fingerprint matches. Those always Pause again.
+            if (pauseReason == ReasonCode.NEW_RECIPIENT || pauseReason == ReasonCode.FORBIDDEN_ACTION ||
+                meta.effect == Effect.E3
+            ) {
                 return PolicyDecision.Pause(pauseReason)
             }
             if (GrantKey.forCall(call, pauseReason) in grants) {

@@ -22,7 +22,8 @@ enum class ReasonCode {
      * The call is outside the contract but the user approved this exact
      * (tool, target, arguments, Pause reason) during the run (§11.3/SEC-02).
      * One-shot: the grant is consumed after the first execution under it.
-     * Not a contract change: the grant lives in memory for this task only.
+     * Never covers irreversible (E3) actions. Not a contract change: the
+     * grant lives in memory for this task only.
      */
     GRANTED_ONCE,
 }

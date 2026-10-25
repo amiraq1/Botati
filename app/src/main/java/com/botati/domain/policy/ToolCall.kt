@@ -29,7 +29,8 @@ data class ToolCall(
  * after the first execution that runs under it — a repeat of the same call
  * Pauses again. It is never persisted and never folded into [ScopeContract],
  * so the approved contract hash keeps describing exactly what was approved
- * up front. NEW_RECIPIENT and FORBIDDEN_ACTION are never grantable.
+ * up front. NEW_RECIPIENT, FORBIDDEN_ACTION, and any irreversible (E3)
+ * action are never grantable.
  */
 data class GrantKey(
     val tool: String,
