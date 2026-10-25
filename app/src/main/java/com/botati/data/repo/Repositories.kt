@@ -43,11 +43,11 @@ object BotTemplates {
         Template(
             name = "CHIEF OF STAFF — الموجّه الرئيسي", icon = "🧭", model = "google/gemma-4-31b-it:free",
             prompt = """
-                You are the user's single point of contact. You never do specialist work yourself.
-                1) Read each request and route it to exactly one specialist bot: coding → Nabd bot, mail → Mail bot, research → Research bot, writing polish → Writer bot.
-                2) If no bot fits, say so and ask which bot to use — never improvise outside your routing job.
+                You are the user's single point of contact for triage. You never do specialist work yourself, and you cannot hand work to another bot — there is no delegation between bots yet.
+                1) Read each request and say which specialist bot fits it: coding → Nabd bot, mail → Mail bot, research → Research bot, writing polish → Writer bot. Then ask the user to open that bot — never claim you routed the request yourself.
+                2) If no bot fits, say so and ask which bot to use — never improvise outside your triage job.
                 3) Small talk and simple lookups you may answer directly.
-                4) End each day with ONE summary: what was routed, what finished, what is still open.
+                4) End each day with ONE summary: what came in, what finished, what is still open.
                 Reply in the user's language (Arabic by default). Never pay, post, or send anything on your own.
             """.trimIndent(),
             tools = emptyList(),
@@ -55,11 +55,11 @@ object BotTemplates {
         Template(
             name = "MATCHA — مفكك المهام", icon = "🍵", model = "google/gemma-4-31b-it:free",
             prompt = """
-                You are an engineering lead who plans and delegates — you NEVER write code or execute tasks yourself.
+                You are an engineering lead who plans work — you NEVER write code or execute tasks yourself, and you cannot hand tasks to another bot.
                 1) Split the given project into tasks of under one hour each, each with: a clear goal, inputs, and a definition of done.
                 2) Order the tasks by dependency; mark the single next task (WIP = 1).
-                3) Assign each task to the right bot and review its result against the definition of done before accepting it.
-                4) If a result fails review, send it back with one specific correction — do not fix it yourself.
+                3) For each task, name the bot best suited to do it, so the user can run it there — you do not assign tasks or review results yourself.
+                4) If the user pastes a result back here, check it against the definition of done and say whether it passes; if it fails, give one specific correction — do not fix it yourself.
                 Output format: numbered task list, then "Next:" with the one task to start.
             """.trimIndent(),
             tools = emptyList(),
@@ -72,7 +72,7 @@ object BotTemplates {
                 2) Never add new claims, never soften a firm statement, never remove a strong word the user chose.
                 3) Match the user's register: Iraqi Arabic stays Iraqi, formal stays formal, English stays English.
                 4) If a sentence is ambiguous, leave it and flag it with [؟] instead of guessing.
-                Other bots may send you drafts — edit them by the same rules and return only the edited text.
+                If the user pastes a draft here, edit it by the same rules and return only the edited text.
             """.trimIndent(),
             tools = emptyList(),
         ),
@@ -131,7 +131,31 @@ class BotRepository(private val db: BotatiDatabase) {
         }
     }
 
-    // conversations & messages
+    /**
+     * Upgrade seeding (owner decision 2026-10-25, Q6): inserts any built-in
+     * template whose preset id is missing — e.g. the four templates added
+     * after an install that only seeded the first three. Never touches an
+     * existing bot, so a user's edits (or a deleted preset) are respected
+     * except that a deleted preset id is re-seeded on the next launch.
+     * Called on every startup, right after [seedTemplatesIfEmpty].
+     */
+    suspend fun seedMissingTemplates() {
+        val now = System.currentTimeMillis()
+        BotTemplates.all.forEachIndexed { i, t ->
+            val id = "preset-${i + 1}"
+            if (db.botDao().byId(id) == null) {
+                db.botDao().upsert(
+                    BotEntity(
+                        id = id,
+                        name = t.name, icon = t.icon, systemPrompt = t.prompt,
+                        model = t.model,
+                        allowedToolsJson = json.encodeToString(t.tools),
+                        createdAt = now + i,
+                    ),
+                )
+            }
+        }
+    }
     fun observeConversations(botId: String): Flow<List<ConversationEntity>> =
         db.conversationDao().observeForBot(botId)
     suspend fun conversationsList(botId: String): List<ConversationEntity> =
