@@ -8,6 +8,7 @@ import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -31,7 +32,10 @@ import kotlinx.serialization.json.putJsonObject
  * explicitly isolates the protocol behind this port so the swap stays a
  * one-file change. This client is dual-era: it tries the LEGACY handshake
  * (what the user's current Worker speaks), and on a version rejection falls
- * back to the stateless 2026-07-28 discovery shape.
+ * back to the stateless 2026-07-28 discovery shape. In the stateless era
+ * every request carries the `_meta` block and the `Mcp-Name` header (MCP-01);
+ * in the LEGACY era a 404 means the server dropped the session, so the
+ * handshake is re-run once and the call retried.
  *
  * Session safety (§0/§21): one client per server; all RPCs for a LEGACY
  * (sessionful) server are serialized through a per-client Mutex — a
@@ -61,38 +65,10 @@ class MinimalMcpClient(
         return mutex.withLock {
             if (connected) return@withLock info!!
             // Attempt 1: LEGACY initialize handshake.
-            val initParams = buildJsonObject {
-                put("protocolVersion", "2025-03-26")
-                putJsonObject("capabilities") {}
-                putJsonObject("clientInfo") { put("name", "Botati"); put("version", "0.1.0") }
-            }
-            val (resp, sid) = postRpcRaw("initialize", initParams, id = nextId++)
-            sessionId = sid
-            val result = resp?.get("result") as? JsonObject
-            if (result != null) {
-                val serverInfo = result["serverInfo"] as? JsonObject
-                info = McpServerInfo(
-                    name = (serverInfo?.get("name") as? JsonPrimitive)?.contentOrNull ?: "",
-                    version = (serverInfo?.get("version") as? JsonPrimitive)?.contentOrNull ?: "",
-                    protocolVersion = (result["protocolVersion"] as? JsonPrimitive)?.contentOrNull ?: "",
-                    era = McpEra.LEGACY,
-                )
-                // notifications/initialized completes the legacy handshake.
-                postNotification("notifications/initialized", JsonObject(emptyMap()))
-                connected = true
-                return@withLock info!!
-            }
+            runLegacyInitialize()?.let { return@withLock it }
             // Attempt 2: stateless 2026-07-28 discovery.
             sessionId = null
-            val discoverParams = buildJsonObject {
-                putJsonObject("_meta") {
-                    put("io.modelcontextprotocol/protocolVersion", "2026-07-28")
-                    putJsonObject("io.modelcontextprotocol/clientInfo") {
-                        put("name", "Botati"); put("version", "0.1.0")
-                    }
-                }
-            }
-            val (resp2, _) = postRpcRaw("server/discover", discoverParams, id = nextId++, stateless = true)
+            val (resp2, _) = postRpcRaw("server/discover", withStatelessMeta(JsonObject(emptyMap())), id = nextId++, stateless = true)
             val result2 = resp2?.get("result") as? JsonObject
             if (result2 != null) {
                 info = McpServerInfo(
@@ -104,18 +80,49 @@ class MinimalMcpClient(
                 connected = true
                 return@withLock info!!
             }
-            val errText = (resp?.get("error") ?: resp2?.get("error"))?.toString() ?: "no result"
+            val errText = (resp2?.get("error"))?.toString() ?: "no result"
             throw IllegalStateException("MCP connect failed: ${SecretRedactor.redact(errText).take(200)}")
         }
+    }
+
+    /**
+     * The LEGACY handshake (2025-03-26 `initialize`), without taking the
+     * mutex — callers already hold it. Returns the server info on success,
+     * null when the server rejects the handshake (so the caller can fall
+     * back to stateless discovery). Also used to re-establish a session
+     * after a LEGACY 404 (MCP-01).
+     */
+    private suspend fun runLegacyInitialize(): McpServerInfo? {
+        val initParams = buildJsonObject {
+            put("protocolVersion", "2025-03-26")
+            putJsonObject("capabilities") {}
+            putJsonObject("clientInfo") { put("name", "Botati"); put("version", CLIENT_VERSION) }
+        }
+        val (resp, sid) = postRpcRaw("initialize", initParams, id = nextId++, allowReinit = false)
+        sessionId = sid
+        val result = resp?.get("result") as? JsonObject ?: return null
+        val serverInfo = result["serverInfo"] as? JsonObject
+        info = McpServerInfo(
+            name = (serverInfo?.get("name") as? JsonPrimitive)?.contentOrNull ?: "",
+            version = (serverInfo?.get("version") as? JsonPrimitive)?.contentOrNull ?: "",
+            protocolVersion = (result["protocolVersion"] as? JsonPrimitive)?.contentOrNull ?: "",
+            era = McpEra.LEGACY,
+        )
+        // notifications/initialized completes the legacy handshake.
+        postNotification("notifications/initialized", JsonObject(emptyMap()))
+        connected = true
+        return info!!
     }
 
     override suspend fun listTools(): List<McpRemoteTool> {
         connect()
         val era = info!!.era
+        val stateless = era == McpEra.STATELESS_2026
         val call: suspend () -> List<McpRemoteTool> = {
+            val params = if (stateless) withStatelessMeta(JsonObject(emptyMap())) else JsonObject(emptyMap())
             val (resp, _) = postRpcRaw(
-                "tools/list", JsonObject(emptyMap()), id = nextId++,
-                stateless = era == McpEra.STATELESS_2026,
+                "tools/list", params, id = nextId++,
+                stateless = stateless,
             )
             val tools = ((resp?.get("result") as? JsonObject)?.get("tools") as? JsonArray)
                 ?: throw IllegalStateException("tools/list failed: ${SecretRedactor.redact(resp.toString()).take(200)}")
@@ -134,14 +141,18 @@ class MinimalMcpClient(
     override suspend fun callTool(name: String, arguments: JsonObject): String {
         connect()
         val era = info!!.era
+        val stateless = era == McpEra.STATELESS_2026
         val call: suspend () -> String = {
-            val params = buildJsonObject {
+            val rawParams = buildJsonObject {
                 put("name", name)
                 put("arguments", arguments)
             }
+            val params = if (stateless) withStatelessMeta(rawParams) else rawParams
             val (resp, _) = postRpcRaw(
                 "tools/call", params, id = nextId++,
-                stateless = era == McpEra.STATELESS_2026,
+                stateless = stateless,
+                // MCP-01: Mcp-Name carries the tool name on tools/call.
+                mcpName = if (stateless) name else null,
             )
             val result = resp?.get("result") as? JsonObject
                 ?: throw IllegalStateException(
@@ -203,6 +214,8 @@ class MinimalMcpClient(
         params: JsonObject,
         id: Int,
         stateless: Boolean = false,
+        mcpName: String? = null,
+        allowReinit: Boolean = true,
     ): Pair<JsonObject?, String?> {
         val body = buildJsonObject {
             put("jsonrpc", "2.0")
@@ -213,13 +226,24 @@ class MinimalMcpClient(
         val response: HttpResponse = http.post(url) {
             authHeaders()
             if (stateless) {
-                header("MCP-Protocol-Version", "2026-07-28")
-                header("Mcp-Method", method)
+                // MCP-01: every stateless (2026-07-28) request carries the
+                // protocol version, the method, and the tool name (tools/call).
+                statelessHeaders(method, mcpName).forEach { (k, v) -> header(k, v) }
             }
             sessionId?.let { header("Mcp-Session-Id", it) }
             header("Accept", "application/json, text/event-stream")
             contentType(ContentType.Application.Json)
             setBody(body.toString())
+        }
+        // MCP-01: a LEGACY server that dropped the session answers 404. Re-run
+        // the handshake once and retry this call; a second 404 is terminal.
+        if (!stateless && allowReinit && response.status == HttpStatusCode.NotFound) {
+            connected = false
+            sessionId = null
+            info = null
+            runLegacyInitialize()
+                ?: throw IllegalStateException("MCP session expired and re-initialize failed")
+            return postRpcRaw(method, params, id, stateless, mcpName, allowReinit = false)
         }
         val sid = response.headers["Mcp-Session-Id"]
         val text = response.bodyAsText()
@@ -237,6 +261,42 @@ class MinimalMcpClient(
         fun validateUrl(url: String) {
             require(url.startsWith("https://")) { "Only https:// URLs are permitted: $url" }
         }
+
+        /**
+         * Client version reported in `clientInfo`. Keep in sync with
+         * `versionName` in app/build.gradle.kts (no BuildConfig here: this
+         * file is also compiled by the standalone kotlinc unit-test script).
+         */
+        const val CLIENT_VERSION = "0.1.4"
+
+        /**
+         * The 2026-07-28 `_meta` block (MCP-01): every stateless request
+         * carries the protocol version, client info, and capabilities. Pure —
+         * unit-tested.
+         */
+        fun statelessMeta(): JsonObject = buildJsonObject {
+            put("io.modelcontextprotocol/protocolVersion", "2026-07-28")
+            putJsonObject("io.modelcontextprotocol/clientInfo") {
+                put("name", "Botati"); put("version", CLIENT_VERSION)
+            }
+            putJsonObject("io.modelcontextprotocol/clientCapabilities") {}
+        }
+
+        /** Returns [params] with the stateless `_meta` block merged in. Pure. */
+        fun withStatelessMeta(params: JsonObject): JsonObject =
+            JsonObject(params + ("_meta" to statelessMeta()))
+
+        /**
+         * Headers for a stateless (2026-07-28) request (MCP-01): the protocol
+         * version and method are mandatory; `Mcp-Name` carries the tool name
+         * on `tools/call` and is omitted otherwise. Pure — unit-tested.
+         */
+        fun statelessHeaders(method: String, mcpName: String?): Map<String, String> =
+            buildMap {
+                put("MCP-Protocol-Version", "2026-07-28")
+                put("Mcp-Method", method)
+                mcpName?.let { put("Mcp-Name", it) }
+            }
 
         /**
          * Parses a Streamable-HTTP response body, which may be plain JSON or
