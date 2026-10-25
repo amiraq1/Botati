@@ -107,6 +107,13 @@ data class ChatRequestDto(
     val stream: Boolean = false,
     val usage: JsonObject? = null,
     @SerialName("response_format") val responseFormat: JsonObject? = null,
+    val provider: ProviderDto? = null,
+)
+
+/** OpenRouter routing controls (`provider` object in the request body). */
+@Serializable
+data class ProviderDto(
+    @SerialName("data_collection") val dataCollection: String,
 )
 
 @Serializable
@@ -284,6 +291,11 @@ class OpenRouterClient(private val http: HttpClient) : LlmPort {
         temperature = temperature,
         stream = stream,
         usage = if (stream) buildJsonObject { put("include", true) } else null,
+        // Owner decision 2026-10-25 (Q4): paid models serve sensitive (D2)
+        // mail work, so their requests must never be routed to a provider
+        // that trains on inputs. Free models keep the documented default
+        // ("allow") so their routing — and availability — is unchanged.
+        provider = ProviderDto(if (model.endsWith(":free")) "allow" else "deny"),
     )
 
     companion object {
