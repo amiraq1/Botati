@@ -7,6 +7,8 @@ import com.botati.domain.agent.LlmPort
 import com.botati.domain.agent.LlmRequest
 import com.botati.domain.agent.RawUsage
 import com.botati.domain.agent.ToolCallDelta
+import com.botati.domain.policy.DataCollection
+import com.botati.domain.policy.dataCollectionFor
 import com.botati.domain.security.SecretRedactor
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
@@ -107,13 +109,18 @@ data class ChatRequestDto(
     val stream: Boolean = false,
     val usage: JsonObject? = null,
     @SerialName("response_format") val responseFormat: JsonObject? = null,
-    val provider: ProviderDto? = null,
+    /**
+     * Required, no default (§18/Q4): every request must decide its routing
+     * explicitly, so no construction site can silently send unconstrained
+     * (implicit "allow"). The value comes from [dataCollectionFor].
+     */
+    val provider: ProviderDto,
 )
 
 /** OpenRouter routing controls (`provider` object in the request body). */
 @Serializable
 data class ProviderDto(
-    @SerialName("data_collection") val dataCollection: String,
+    @SerialName("data_collection") val dataCollection: DataCollection,
 )
 
 @Serializable
@@ -291,15 +298,9 @@ class OpenRouterClient(private val http: HttpClient) : LlmPort {
         temperature = temperature,
         stream = stream,
         usage = if (stream) buildJsonObject { put("include", true) } else null,
-        // §18/Q4 (owner decision 2026-10-25, refined): the invariant is
-        // disclosure, not price. A request is deny-routed when it may carry
-        // D2 content: either the model is paid (mail work is paid by design)
-        // or the session is already D2-contaminated — after the first D2
-        // tool result, every later request is deny, even on a free model.
-        // A free-model bot with a mail tool attached therefore cannot leak
-        // read_email results under "allow": the D2 result only enters the
-        // context in the next request, which is already deny.
-        provider = ProviderDto(if (!model.endsWith(":free") || d2Contaminated) "deny" else "allow"),
+        // §18/Q4: routing is decided by the pure dataCollectionFor — the
+        // decision history lives in its KDoc, not here.
+        provider = ProviderDto(dataCollectionFor(model, d2Contaminated)),
     )
 
     companion object {

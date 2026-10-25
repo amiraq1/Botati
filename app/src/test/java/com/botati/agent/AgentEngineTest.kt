@@ -216,6 +216,68 @@ class AgentEngineTest {
         assertFalse("web_fetch must NOT be executed silently after read_file", executed.contains("web_fetch"))
     }
 
+    // §18/Q4: a resumed conversation whose saved history already contains
+    // a D2 tool result stays contaminated on a free model — the engine stops
+    // before sending anything, with a clear reason, instead of leaking the
+    // history under "allow" or failing with a generic provider error.
+    @Test fun resumeWithD2History_onFreeModel_stopsBeforeSending() = runBlocking {
+        val history = baseMessages + LlmMessage("tool", "secret mail body", name = "mail__read_email")
+        val llm = FakeLlm(textScript("done"))
+        val registry = mapOf("mail__read_email" to meta("mail__read_email", Effect.E0, Disclosure.D2))
+        val events = engine(llm, FakeExecutor(), FakeApprovals(true), ListAudit()).run(
+            "bot1", "google/gemma-4-31b-it:free", 0.7,
+            BotPolicyProfile("bot1", setOf("mail__read_email")),
+            registry,
+            history,
+            Session.Chat,
+        ).toList()
+        assertTrue("no request must be sent", llm.seen.isEmpty())
+        val stopped = events.filterIsInstance<EngineEvent.Stopped>().singleOrNull()
+            ?: error("expected a Stopped event, got $events")
+        assertEquals(AgentEngine.FREE_MODEL_D2_REASON, stopped.reason)
+    }
+
+    @Test fun resumeWithD2History_onPaidModel_firstRequestDeny() = runBlocking {
+        val history = baseMessages + LlmMessage("tool", "secret mail body", name = "mail__read_email")
+        val llm = FakeLlm(textScript("done"))
+        val registry = mapOf("mail__read_email" to meta("mail__read_email", Effect.E0, Disclosure.D2))
+        val events = engine(llm, FakeExecutor(), FakeApprovals(true), ListAudit()).run(
+            "bot1", "openai/gpt-4o-mini", 0.7,
+            BotPolicyProfile("bot1", setOf("mail__read_email")),
+            registry,
+            history,
+            Session.Chat,
+        ).toList()
+        assertEquals(1, llm.seen.size)
+        assertTrue(llm.seen[0].d2Contaminated)
+        assertTrue(events.last() is EngineEvent.Done)
+    }
+
+    // §18/Q4: derivation reads the FULL saved history, before truncation.
+    // The D2 tool message here is the oldest turn and is dropped by the
+    // truncator — the flag must survive anyway, because later turns may
+    // still quote it.
+    @Test fun d2History_survivesTruncation() = runBlocking {
+        val filler = (0..21).flatMap { i ->
+            listOf(LlmMessage("user", "filler user $i"), LlmMessage("assistant", "filler answer $i"))
+        }
+        val history = baseMessages +
+            LlmMessage("tool", "secret mail body", name = "mail__read_email") + filler
+        val llm = FakeLlm(textScript("done"))
+        val registry = mapOf("mail__read_email" to meta("mail__read_email", Effect.E0, Disclosure.D2))
+        val events = engine(llm, FakeExecutor(), FakeApprovals(true), ListAudit()).run(
+            "bot1", "openai/gpt-4o-mini", 0.7,
+            BotPolicyProfile("bot1", setOf("mail__read_email")),
+            registry,
+            history,
+            Session.Chat,
+        ).toList()
+        assertTrue(events.any { it is EngineEvent.ContextTruncated })
+        assertEquals(1, llm.seen.size)
+        assertTrue(llm.seen[0].d2Contaminated)
+        assertTrue(events.last() is EngineEvent.Done)
+    }
+
     // §18/Q4: after the first D2 tool result, the engine marks every later
     // LLM request contaminated, so the provider routes it with
     // data_collection "deny" even on a free model.
