@@ -33,6 +33,15 @@ jobs:
       - name: Run Android Lint
         run: ./gradlew :app:lintDebug --stacktrace
 
+      - name: Guard — ChatRequestDto has a single construction site
+        # §18/Q4: the provider field is required (no default), so every
+        # request must go through LlmRequest.toDto. The declaration plus
+        # that one call site are the only two matches; a third means a new
+        # construction site is bypassing the routing decision.
+        run: |
+          count=$(grep -rn "ChatRequestDto(" app/src/main/java --include='*.kt' | wc -l)
+          test "$count" -eq 2 || { echo "expected 2 ChatRequestDto( sites (declaration + toDto), found $count"; exit 1; }
+
       - name: Assemble Debug APK
         run: ./gradlew :app:assembleDebug --stacktrace
 

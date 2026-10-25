@@ -42,12 +42,15 @@ class OpenRouterClientProviderTest {
         private val body: String = SSE_OK,
     ) {
         var capturedBody: String? = null
+        val capturedBodies = mutableListOf<String>()
         val engine = MockEngine { request ->
-            capturedBody = when (val b = request.body) {
+            val text = when (val b = request.body) {
                 is TextContent -> b.text
                 is OutgoingContent.ByteArrayContent -> b.bytes().decodeToString()
                 else -> error("unexpected request body type: ${b::class}")
             }
+            capturedBody = text
+            capturedBodies += text
             respond(
                 content = body,
                 status = status,
@@ -105,6 +108,19 @@ class OpenRouterClientProviderTest {
         val capturing = CapturingEngine()
         stream(client(capturing), "google/gemma-4-31b-it:free", d2Contaminated = true)
         assertEquals("deny", dataCollection(capturing.capturedBody))
+    }
+
+    @Test fun freeModel_sequence_toolCallThenD2Result_deniesSecondRequest() {
+        // Request N: free model, clean session -> allow. The D2 result
+        // arrives; request N+1 carries it -> deny. (The engine flipping
+        // the flag after a D2 result is pinned by the domain test
+        // d2Result_marksLaterRequestsContaminated; this pins the client
+        // mapping for the two requests.)
+        val capturing = CapturingEngine()
+        val c = client(capturing)
+        stream(c, "google/gemma-4-31b-it:free", d2Contaminated = false)
+        stream(c, "google/gemma-4-31b-it:free", d2Contaminated = true)
+        assertEquals(listOf("allow", "deny"), capturing.capturedBodies.map { dataCollection(it) })
     }
 
     @Test fun paidModel_402_surfacesAsClearError() {
