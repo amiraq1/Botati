@@ -8,7 +8,8 @@ import org.junit.Test
 
 /**
  * Spec §12/§14: the vault stays out of backup *and* out of device-to-device
- * transfer, and the rules are wired into the manifest.
+ * transfer, and the rules are wired into the manifest. Since the 2026-10-25
+ * owner decision (Q3) the Room database is excluded the same way.
  *
  * This is a static regression test, not a device test: it reads the shipped XML
  * and fails if an exclusion is dropped. It is the test §14 asks for on the
@@ -18,6 +19,12 @@ class VaultBackupRulesTest {
 
     private val ciphertext = """domain="file" path="datastore/vault.preferences_pb""""
     private val keysetPrefs = """domain="sharedpref" path="botati_vault_keyset_prefs.xml""""
+    // Owner decision 2026-10-25 (Q3): the Room database stays out of backup
+    // and D2D in full — mail content and the audit log outrank moving chats
+    // between devices. WAL siblings included: recent writes live in -wal.
+    private val dbFile = """domain="database" path="botati.db""""
+    private val dbWal = """domain="database" path="botati.db-wal""""
+    private val dbShm = """domain="database" path="botati.db-shm""""
 
     private fun findFile(relative: String): File? {
         var dir: File? = File(System.getProperty("user.dir")).absoluteFile
@@ -73,5 +80,32 @@ class VaultBackupRulesTest {
         assertTrue(text.contains(ciphertext))
         assertTrue(text.contains(keysetPrefs))
         assertFalse("legacy file must not carry the new-format root", text.contains("<data-extraction-rules>"))
+    }
+
+    @Test fun dataExtractionRulesExcludeDatabaseFromCloudBackup() {
+        val f = findFile("src/main/res/xml/data_extraction_rules.xml")
+        assumeTrue("rules not found", f != null)
+        val cloud = block(f!!.readText(), "cloud-backup")
+        assertTrue("database must not be cloud-backed-up", cloud.contains(dbFile))
+        assertTrue("WAL file must not be cloud-backed-up", cloud.contains(dbWal))
+        assertTrue("SHM file must not be cloud-backed-up", cloud.contains(dbShm))
+    }
+
+    @Test fun dataExtractionRulesExcludeDatabaseFromDeviceTransfer() {
+        val f = findFile("src/main/res/xml/data_extraction_rules.xml")
+        assumeTrue("rules not found", f != null)
+        val transfer = block(f!!.readText(), "device-transfer")
+        assertTrue("database must not migrate over D2D", transfer.contains(dbFile))
+        assertTrue("WAL file must not migrate over D2D", transfer.contains(dbWal))
+        assertTrue("SHM file must not migrate over D2D", transfer.contains(dbShm))
+    }
+
+    @Test fun legacyFullBackupContentExcludesDatabase() {
+        val f = findFile("src/main/res/xml/backup_rules.xml")
+        assumeTrue("legacy rules not found", f != null)
+        val text = f!!.readText()
+        assertTrue(text.contains(dbFile))
+        assertTrue(text.contains(dbWal))
+        assertTrue(text.contains(dbShm))
     }
 }
