@@ -16,14 +16,26 @@
      The wrapped keyset is useless without the Keystore key, so backing it up is
      an availability problem (a restored install cannot decrypt anything), not a
      confidentiality leak — but a restored install that silently loses every key
-     is still a defect worth preventing. -->
+     is still a defect worth preventing.
+
+     Owner decision 2026-10-25 (Q3): the Room database is excluded too, in
+     full — mail content and the audit log matter more than moving chats
+     between devices. The -wal/-shm siblings are excluded with it: Room runs
+     in WAL mode by default, so recent writes live in botati.db-wal, and
+     excluding only botati.db would still leak them. -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="file" path="datastore/vault.preferences_pb" />
         <exclude domain="sharedpref" path="botati_vault_keyset_prefs.xml" />
+        <exclude domain="database" path="botati.db" />
+        <exclude domain="database" path="botati.db-wal" />
+        <exclude domain="database" path="botati.db-shm" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="file" path="datastore/vault.preferences_pb" />
         <exclude domain="sharedpref" path="botati_vault_keyset_prefs.xml" />
+        <exclude domain="database" path="botati.db" />
+        <exclude domain="database" path="botati.db-wal" />
+        <exclude domain="database" path="botati.db-shm" />
     </device-transfer>
 </data-extraction-rules>

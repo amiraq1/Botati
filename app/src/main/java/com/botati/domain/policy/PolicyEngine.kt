@@ -14,10 +14,12 @@ import kotlinx.serialization.json.contentOrNull
  * design: scope is checked here, where it can be unit-tested.
  *
  * Precedence (§6.2): Deny → ceiling Stop → out-of-contract Pause →
- * chat tier Ask/Allow → Allow. A Pause approval grants that exact action
- * once (§11.3/SEC-02): the grant overrides only the shown Pause reason,
- * never NEW_RECIPIENT or FORBIDDEN_ACTION, never an irreversible (E3)
- * action, and is consumed after the first execution under it.
+ * chat tier Ask/Allow → Allow. After D2 contamination, remote calls Pause
+ * (SEC-01) before scope is even considered. A Pause approval grants that
+ * exact action once (§11.3/SEC-02): the grant overrides only the shown
+ * Pause reason, never NEW_RECIPIENT or FORBIDDEN_ACTION, never an
+ * irreversible (E3) action, and is consumed after the first execution
+ * under it.
  */
 object PolicyEngine {
 
@@ -98,6 +100,15 @@ object PolicyEngine {
         }
         if (contract.expiresAtMs != null && nowMs > contract.expiresAtMs) {
             return PolicyDecision.Stop(ReasonCode.CONTRACT_EXPIRED)
+        }
+
+        // SEC-01 (owner decision 2026-10-25): PRIVATE_TO_LLM authorizes the
+        // LLM provider only — never a third-party host. Once D2 data is in
+        // context, any outbound remote call Pauses, whatever the contract
+        // allows. Checked before scope, so no grant can override it: each
+        // remote call after contamination needs its own tap.
+        if (counters.d2Contaminated && meta.source == ToolSource.REMOTE_API) {
+            return PolicyDecision.Pause(ReasonCode.DISCLOSURE_NOT_IN_CONTRACT)
         }
 
         // 3) Contract scope, evaluated FIRST: a grant may only override the

@@ -4,4 +4,9 @@
 <full-backup-content>
     <exclude domain="file" path="datastore/vault.preferences_pb" />
     <exclude domain="sharedpref" path="botati_vault_keyset_prefs.xml" />
+    <!-- Owner decision 2026-10-25 (Q3): Room database excluded in full, with
+         its WAL siblings (recent writes live in botati.db-wal). -->
+    <exclude domain="database" path="botati.db" />
+    <exclude domain="database" path="botati.db-wal" />
+    <exclude domain="database" path="botati.db-shm" />
 </full-backup-content>

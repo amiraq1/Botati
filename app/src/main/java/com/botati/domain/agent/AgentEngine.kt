@@ -188,9 +188,13 @@ class AgentEngine(
                                     // it; NEW_RECIPIENT and FORBIDDEN_ACTION are never
                                     // grantable, and neither is any irreversible (E3)
                                     // action — sends and deletes always Pause again.
+                                    // A DISCLOSURE_NOT_IN_CONTRACT grant would be dead:
+                                    // SEC-01 re-checks contamination on every call, so
+                                    // no grant is recorded for it either.
                                     if (decision is PolicyDecision.Pause &&
                                         decision.reasonCode != ReasonCode.NEW_RECIPIENT &&
                                         decision.reasonCode != ReasonCode.FORBIDDEN_ACTION &&
+                                        decision.reasonCode != ReasonCode.DISCLOSURE_NOT_IN_CONTRACT &&
                                         meta.effect != Effect.E3
                                     ) {
                                         val s = activeSession
