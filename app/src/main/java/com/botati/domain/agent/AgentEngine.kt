@@ -53,6 +53,9 @@ class AgentEngine(
         var steps = 0
         var consecutiveUnknown = 0
         var finished = false
+        // §11.3: approvals granted mid-run are held here, not written into the
+        // contract, so the approved hash keeps describing what the user saw.
+        var activeSession = session
 
         // Context truncation before the first request (§27).
         val system = messages.filter { it.role == "system" }
@@ -65,8 +68,8 @@ class AgentEngine(
             if (messages.none { it.role == "system" }) messages.addAll(0, system)
         }
 
-        val maxSteps = when (session) {
-            is Session.Task -> session.contract.maxSteps
+        val maxSteps = when (val s = activeSession) {
+            is Session.Task -> s.contract.maxSteps
             is Session.Chat -> defaultMaxSteps
         }
         val toolSpecs = registry.values
@@ -154,7 +157,7 @@ class AgentEngine(
                             costUsedUsd = tracker.totalKnownCostUsd,
                             d2Contaminated = d2Contaminated,
                         )
-                        val decision = PolicyEngine.decide(profile, call, meta, session, counters, nowMs())
+                        val decision = PolicyEngine.decide(profile, call, meta, activeSession, counters, nowMs())
                         audit.record(auditRecord(botId, taskId, call, meta, decisionName(decision), decision))
 
                         when (decision) {
@@ -176,6 +179,15 @@ class AgentEngine(
                                     messages += toolMessage(assembledCall, result)
                                     emit(EngineEvent.ToolFinished(call, result, true))
                                 } else {
+                                    // §11.3: the tap authorizes this action alone, for this
+                                    // task run. Without recording it the identical next call
+                                    // would Pause again and the approval would mean nothing.
+                                    if (decision is PolicyDecision.Pause) {
+                                        val s = activeSession
+                                        if (s is Session.Task) {
+                                            activeSession = s.withGrant(call.name, call.target)
+                                        }
+                                    }
                                     executeAndAppend(call, assembledCall, messages, emitEvent)
                                     if (meta.disclosure == Disclosure.D2) d2Contaminated = true
                                 }
@@ -192,7 +204,7 @@ class AgentEngine(
                         }
                     }
 
-                    if (session is Session.Task && tracker.shouldStopForUnknownCost()) {
+                    if (activeSession is Session.Task && tracker.shouldStopForUnknownCost()) {
                         emit(EngineEvent.Stopped("unknown-cost steps ceiling (§5.5)"))
                         finished = true
                     }

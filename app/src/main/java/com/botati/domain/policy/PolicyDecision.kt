@@ -17,12 +17,21 @@ enum class ReasonCode {
     NEW_RECIPIENT,
     DISCLOSURE_NOT_IN_CONTRACT,
     ACTION_BEYOND_VERB,
+
+    /**
+     * The call is outside the contract but the user approved this exact
+     * (tool, target) pair during the run (§11.3). Not a contract change:
+     * the grant lives in memory for this task only.
+     */
+    GRANTED_ONCE,
 }
 
 /**
  * The five distinct decisions (§6.2). They are NOT folded into one another:
- * Pause (task, out of contract) extends the contract for one action when
- * approved; Ask (chat) is a one-off consent; Stop ends the task on a ceiling.
+ * Pause (task, out of contract) adds the approved action to the *session's*
+ * one-action grants for the rest of this task run — the approved contract itself
+ * is never mutated, so its hash keeps meaning what the user saw; Ask (chat) is a
+ * one-off consent; Stop ends the task on a ceiling.
  */
 sealed class PolicyDecision {
     abstract val reasonCode: ReasonCode

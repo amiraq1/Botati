@@ -20,10 +20,23 @@ data class ToolCall(
     val recipients: List<String> = emptyList(),
 )
 
+/**
+ * One action the user approved while the task was running (§11.3: "the approval
+ * adds that action alone to the contract"). Held in memory for the current task
+ * run only — it is never persisted and never folded into [ScopeContract], so the
+ * approved contract hash keeps describing exactly what was approved up front.
+ */
+data class GrantKey(val tool: String, val target: String?)
+
 /** Execution session for a decision: plain chat, or a task under a contract. */
 sealed interface Session {
     data object Chat : Session
-    data class Task(val contract: ScopeContract) : Session
+    data class Task(
+        val contract: ScopeContract,
+        val grants: Set<GrantKey> = emptySet(),
+    ) : Session {
+        fun withGrant(tool: String, target: String?): Task = copy(grants = grants + GrantKey(tool, target))
+    }
 }
 
 /** Monotonic counters for the current task (or conversation turn). */

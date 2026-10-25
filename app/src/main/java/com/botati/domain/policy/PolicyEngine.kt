@@ -44,7 +44,7 @@ object PolicyEngine {
 
         return when (session) {
             is Session.Chat -> decideChat(bot, call, meta, disclosure)
-            is Session.Task -> decideTask(call, meta, disclosure, session.contract, counters, nowMs)
+            is Session.Task -> decideTask(call, meta, disclosure, session.contract, session.grants, counters, nowMs)
         }
     }
 
@@ -81,6 +81,7 @@ object PolicyEngine {
         meta: ToolMeta,
         disclosure: Disclosure,
         contract: ScopeContract,
+        grants: Set<GrantKey>,
         counters: Counters,
         nowMs: Long,
     ): PolicyDecision {
@@ -94,6 +95,14 @@ object PolicyEngine {
         }
         if (contract.expiresAtMs != null && nowMs > contract.expiresAtMs) {
             return PolicyDecision.Stop(ReasonCode.CONTRACT_EXPIRED)
+        }
+
+        // 2b) §11.3: an action the user approved mid-run is treated as inside the
+        //     contract for this exact (tool, target) pair — otherwise approving it
+        //     would only move the wall one step and the next identical call would
+        //     ask again. Ceilings above still apply; this bypasses scope only.
+        if (GrantKey(call.name, call.target) in grants) {
+            return PolicyDecision.Allow(ReasonCode.GRANTED_ONCE)
         }
 
         // 3) Contract scope: tool, verb ceiling, forbidden actions, target,
