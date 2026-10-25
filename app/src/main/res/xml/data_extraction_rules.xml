@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spec §12/§0: the vault never leaves the device — neither by backup nor by
+     device-to-device transfer.
+
+     Why this file exists alongside android:allowBackup="false":
+     on Android 12+ some OEM devices still migrate app data over D2D even when
+     allowBackup is false, and <device-transfer> rules here are the only
+     supported way to exclude specific files from that path. The legacy
+     res/xml/backup_rules.xml covers API <= 30, where fullBackupContent is read.
+
+     Two artifacts matter, not one:
+       file       datastore/vault.preferences_pb   — Base64 ciphertext slots
+       sharedpref botati_vault_keyset_prefs.xml    — the Tink keyset, itself
+                                                     wrapped by an Android
+                                                     Keystore master key
+     The wrapped keyset is useless without the Keystore key, so backing it up is
+     an availability problem (a restored install cannot decrypt anything), not a
+     confidentiality leak — but a restored install that silently loses every key
+     is still a defect worth preventing. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="datastore/vault.preferences_pb" />
+        <exclude domain="sharedpref" path="botati_vault_keyset_prefs.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="datastore/vault.preferences_pb" />
+        <exclude domain="sharedpref" path="botati_vault_keyset_prefs.xml" />
+    </device-transfer>
+</data-extraction-rules>
