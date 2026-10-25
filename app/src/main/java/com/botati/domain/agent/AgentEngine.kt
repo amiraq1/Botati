@@ -9,6 +9,7 @@ import com.botati.domain.policy.Session
 import com.botati.domain.policy.TargetKind
 import com.botati.domain.policy.ToolCall
 import com.botati.domain.policy.ToolMeta
+import com.botati.domain.policy.isDenyCompatibleFreeModel
 import com.botati.domain.policy.isFreeModel
 import com.botati.domain.security.SecretRedactor
 import kotlinx.coroutines.currentCoroutineContext
@@ -83,12 +84,13 @@ class AgentEngine(
 
         while (!finished) {
             currentCoroutineContext().ensureActive()
-            // §18/Q4: a free model cannot continue a D2-contaminated session.
-            // Likely no free endpoint matches deny (to be verified live after
-            // top-up), so the request would fail with "no matching endpoints".
-            // Stop with a clear reason instead of a generic failure; the user
-            // switches the model and retries.
-            if (d2Contaminated && isFreeModel(model)) {
+            // §18/Q4: a free model cannot continue a D2-contaminated session
+            // unless it is allowlisted as deny-compatible (verified live
+            // 2026-10-26: most free models have no deny-matching endpoint
+            // and fail with "no matching endpoints"). Stop with a clear
+            // reason instead of a generic failure; the user switches the
+            // model and retries.
+            if (d2Contaminated && isFreeModel(model) && !isDenyCompatibleFreeModel(model)) {
                 emit(EngineEvent.Stopped(FREE_MODEL_D2_REASON))
                 finished = true
                 break
@@ -175,13 +177,15 @@ class AgentEngine(
                         val decision = PolicyEngine.decide(profile, call, meta, session, counters, nowMs())
                         audit.record(auditRecord(botId, taskId, call, meta, decisionName(decision), decision))
 
-                        // §18/Q4: a D2 tool must never execute on a free model —
-                        // the result would contaminate the session and the next
+                        // §18/Q4: a D2 tool must never execute on a free model
+                        // unless it is allowlisted as deny-compatible — the
+                        // result would contaminate the session and the next
                         // request could not be sent. Refuse before asking or
                         // executing, with a clear reason; the user switches
                         // the model. (Deny/Stop decisions execute nothing, so
                         // they need no guard.)
                         if (meta.disclosure == Disclosure.D2 && isFreeModel(model) &&
+                            !isDenyCompatibleFreeModel(model) &&
                             decision !is PolicyDecision.Deny && decision !is PolicyDecision.Stop
                         ) {
                             emit(EngineEvent.Stopped(FREE_MODEL_D2_REASON))

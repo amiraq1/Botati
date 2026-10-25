@@ -237,6 +237,25 @@ class AgentEngineTest {
         assertEquals(AgentEngine.FREE_MODEL_D2_REASON, stopped.reason)
     }
 
+    // §18/Q4 (2026-10-26): Flint is allowlisted — a resumed D2 history on
+    // Flint proceeds, and the first request is marked contaminated (deny),
+    // so the provider routes it with data_collection "deny".
+    @Test fun resumeWithD2History_onAllowlistedFreeModel_proceedsDeny() = runBlocking {
+        val history = baseMessages + LlmMessage("tool", "secret mail body", name = "mail__read_email")
+        val llm = FakeLlm(textScript("done"))
+        val registry = mapOf("mail__read_email" to meta("mail__read_email", Effect.E0, Disclosure.D2))
+        val events = engine(llm, FakeExecutor(), FakeApprovals(true), ListAudit()).run(
+            "bot1", "recursive/flint-v1.0:free", 0.7,
+            BotPolicyProfile("bot1", setOf("mail__read_email")),
+            registry,
+            history,
+            Session.Chat,
+        ).toList()
+        assertEquals(1, llm.seen.size)
+        assertTrue(llm.seen[0].d2Contaminated)
+        assertTrue(events.last() is EngineEvent.Done)
+    }
+
     @Test fun resumeWithD2History_onPaidModel_firstRequestDeny() = runBlocking {
         val history = baseMessages + LlmMessage("tool", "secret mail body", name = "mail__read_email")
         val llm = FakeLlm(textScript("done"))
@@ -316,5 +335,86 @@ class AgentEngineTest {
         assertTrue(llm.seen[1].d2Contaminated)
         assertEquals(1, exec.calls.size)
         assertTrue(events.last() is EngineEvent.Done)
+    }
+
+    // §18/Q4 (2026-10-26): the D2-tool guard does not fire on an allowlisted
+    // free model — Flint executes the mail read and the next request is
+    // contaminated (deny), so mail works on a free model without a top-up.
+    @Test fun d2Tool_onAllowlistedFreeModel_executes() = runBlocking {
+        val contract = ScopeContract(
+            taskId = "task1",
+            verb = ContractVerb.REPLY_AND_SEND,
+            allowedTools = listOf("mail__read_email"),
+            targets = ContractTargets(
+                threadIds = listOf("t1"),
+                threadParticipantIds = listOf("alice@x.com"),
+                originalSenderId = "alice@x.com",
+            ),
+            dataDisclosure = DataDisclosureScope.PRIVATE_TO_LLM,
+            recipientsLock = RecipientLock.THREAD_PARTICIPANTS_ONLY,
+            forbidden = listOf(ForbiddenAction.FORWARD, ForbiddenAction.NEW_RECIPIENT),
+            maxSteps = 25,
+            budgetUsd = 0.30,
+            expiresAtMs = null,
+        )
+        val llm = FakeLlm(
+            toolScript("mail__read_email", """{"threadId":"t1"}"""),
+            textScript("done"),
+        )
+        val exec = FakeExecutor(); val audit = ListAudit()
+        val registry = mapOf("mail__read_email" to meta("mail__read_email", Effect.E0, Disclosure.D2))
+        val events = engine(llm, exec, FakeApprovals(true), audit).run(
+            "bot1", "recursive/flint-v1.0:free", 0.7,
+            BotPolicyProfile("bot1", setOf("mail__read_email")),
+            registry,
+            baseMessages,
+            Session.Task(contract),
+        ).toList()
+        assertEquals(2, llm.seen.size)
+        assertFalse(llm.seen[0].d2Contaminated)
+        assertTrue(llm.seen[1].d2Contaminated)
+        assertEquals(1, exec.calls.size)
+        assertTrue(events.last() is EngineEvent.Done)
+    }
+
+    // §18/Q4: the D2-tool guard still fires on a non-allowlisted free model
+    // (Gemma routed under deny but only ever returned upstream 429s, so it
+    // stays fail-closed) — the tool never executes and the run stops with
+    // the clear reason instead of contaminating the session.
+    @Test fun d2Tool_onOtherFreeModel_stopsBeforeExecuting() = runBlocking {
+        val contract = ScopeContract(
+            taskId = "task1",
+            verb = ContractVerb.REPLY_AND_SEND,
+            allowedTools = listOf("mail__read_email"),
+            targets = ContractTargets(
+                threadIds = listOf("t1"),
+                threadParticipantIds = listOf("alice@x.com"),
+                originalSenderId = "alice@x.com",
+            ),
+            dataDisclosure = DataDisclosureScope.PRIVATE_TO_LLM,
+            recipientsLock = RecipientLock.THREAD_PARTICIPANTS_ONLY,
+            forbidden = listOf(ForbiddenAction.FORWARD, ForbiddenAction.NEW_RECIPIENT),
+            maxSteps = 25,
+            budgetUsd = 0.30,
+            expiresAtMs = null,
+        )
+        val llm = FakeLlm(
+            toolScript("mail__read_email", """{"threadId":"t1"}"""),
+            textScript("done"),
+        )
+        val exec = FakeExecutor(); val audit = ListAudit()
+        val registry = mapOf("mail__read_email" to meta("mail__read_email", Effect.E0, Disclosure.D2))
+        val events = engine(llm, exec, FakeApprovals(true), audit).run(
+            "bot1", "google/gemma-4-31b-it:free", 0.7,
+            BotPolicyProfile("bot1", setOf("mail__read_email")),
+            registry,
+            baseMessages,
+            Session.Task(contract),
+        ).toList()
+        assertEquals(1, llm.seen.size)
+        assertTrue(exec.calls.isEmpty())
+        val stopped = events.filterIsInstance<EngineEvent.Stopped>().singleOrNull()
+            ?: error("expected a Stopped event, got $events")
+        assertEquals(AgentEngine.FREE_MODEL_D2_REASON, stopped.reason)
     }
 }
