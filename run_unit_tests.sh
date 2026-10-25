@@ -13,6 +13,11 @@ mkdir -p "$TEST_CLASSES"
 
 CP=$(ls "$DEPS_DIR"/*.jar | paste -sd ":" -)
 
+# Gradle-only tests need BuildConfig / Ktor MockEngine, which the standalone
+# kotlinc script cannot compile; CI runs them via testDebugUnitTest.
+GRADLE_ONLY_TESTS="OpenRouterClientProviderTest.kt"
+TEST_SOURCES=$(find "$ROOT_DIR/app/src/test/java" -name '*.kt' | grep -v "$GRADLE_ONLY_TESTS")
+
 echo "==> Compiling domain and test sources..."
 kotlinc \
   -cp "$CP" \
@@ -21,7 +26,7 @@ kotlinc \
   $(find "$ROOT_DIR/app/src/main/java/com/botati/domain" -name '*.kt') \
   "$ROOT_DIR/app/src/main/java/com/botati/infrastructure/mcp/McpClientPort.kt" \
   "$ROOT_DIR/app/src/main/java/com/botati/infrastructure/mcp/MinimalMcpClient.kt" \
-  $(find "$ROOT_DIR/app/src/test/java" -name '*.kt')
+  $TEST_SOURCES
 
 echo "==> Running JUnit tests..."
 CP_RUN=$(ls "$DEPS_DIR"/*.jar | grep -v "junit-platform-console-standalone" | paste -sd ":" -)
