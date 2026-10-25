@@ -291,11 +291,15 @@ class OpenRouterClient(private val http: HttpClient) : LlmPort {
         temperature = temperature,
         stream = stream,
         usage = if (stream) buildJsonObject { put("include", true) } else null,
-        // Owner decision 2026-10-25 (Q4): paid models serve sensitive (D2)
-        // mail work, so their requests must never be routed to a provider
-        // that trains on inputs. Free models keep the documented default
-        // ("allow") so their routing — and availability — is unchanged.
-        provider = ProviderDto(if (model.endsWith(":free")) "allow" else "deny"),
+        // §18/Q4 (owner decision 2026-10-25, refined): the invariant is
+        // disclosure, not price. A request is deny-routed when it may carry
+        // D2 content: either the model is paid (mail work is paid by design)
+        // or the session is already D2-contaminated — after the first D2
+        // tool result, every later request is deny, even on a free model.
+        // A free-model bot with a mail tool attached therefore cannot leak
+        // read_email results under "allow": the D2 result only enters the
+        // context in the next request, which is already deny.
+        provider = ProviderDto(if (!model.endsWith(":free") || d2Contaminated) "deny" else "allow"),
     )
 
     companion object {

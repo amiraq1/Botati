@@ -21,6 +21,13 @@ data class LlmRequest(
     val messages: List<LlmMessage>,
     val tools: List<LlmToolSpec> = emptyList(),
     val temperature: Double = 0.7,
+    /**
+     * True once a D2 (private) tool result has entered this session's
+     * context (§18/Q4). The provider must route such a request with
+     * `data_collection: "deny"` — D2 content never reaches a provider
+     * that may collect it, whatever model is in use.
+     */
+    val d2Contaminated: Boolean = false,
 )
 
 sealed interface LlmEvent {

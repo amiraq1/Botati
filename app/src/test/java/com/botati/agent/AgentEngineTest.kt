@@ -14,9 +14,15 @@ import com.botati.domain.agent.RawUsage
 import com.botati.domain.agent.ToolCallDelta
 import com.botati.domain.agent.ToolExecutorPort
 import com.botati.domain.policy.BotPolicyProfile
+import com.botati.domain.policy.ContractTargets
+import com.botati.domain.policy.ContractVerb
+import com.botati.domain.policy.DataDisclosureScope
 import com.botati.domain.policy.Disclosure
 import com.botati.domain.policy.Effect
+import com.botati.domain.policy.ForbiddenAction
 import com.botati.domain.policy.PolicyDecision
+import com.botati.domain.policy.RecipientLock
+import com.botati.domain.policy.ScopeContract
 import com.botati.domain.policy.Session
 import com.botati.domain.policy.ToolCall
 import com.botati.domain.policy.ToolMeta
@@ -37,8 +43,10 @@ class AgentEngineTest {
     private class FakeLlm(vararg scripts: List<LlmEvent>) : LlmPort {
         private val queue = ArrayDeque(scripts.toList())
         var requests = 0
+        val seen = mutableListOf<LlmRequest>()
         override fun stream(request: LlmRequest): Flow<LlmEvent> = flow {
             requests++
+            seen += request
             val script = if (queue.isEmpty()) listOf(LlmEvent.TextDelta("fallback"), LlmEvent.Finished("stop"))
             else queue.removeFirst()
             script.forEach { emit(it) }
@@ -206,5 +214,45 @@ class AgentEngineTest {
         val executed = exec.calls.map { it.name }
         assertTrue("read_file should have been executed", executed.contains("read_file"))
         assertFalse("web_fetch must NOT be executed silently after read_file", executed.contains("web_fetch"))
+    }
+
+    // §18/Q4: after the first D2 tool result, the engine marks every later
+    // LLM request contaminated, so the provider routes it with
+    // data_collection "deny" even on a free model.
+    @Test fun d2Result_marksLaterRequestsContaminated() = runBlocking {
+        val contract = ScopeContract(
+            taskId = "task1",
+            verb = ContractVerb.REPLY_AND_SEND,
+            allowedTools = listOf("mail__read_email"),
+            targets = ContractTargets(
+                threadIds = listOf("t1"),
+                threadParticipantIds = listOf("alice@x.com"),
+                originalSenderId = "alice@x.com",
+            ),
+            dataDisclosure = DataDisclosureScope.PRIVATE_TO_LLM,
+            recipientsLock = RecipientLock.THREAD_PARTICIPANTS_ONLY,
+            forbidden = listOf(ForbiddenAction.FORWARD, ForbiddenAction.NEW_RECIPIENT),
+            maxSteps = 25,
+            budgetUsd = 0.30,
+            expiresAtMs = null,
+        )
+        val llm = FakeLlm(
+            toolScript("mail__read_email", """{"threadId":"t1"}"""),
+            textScript("done"),
+        )
+        val exec = FakeExecutor(); val audit = ListAudit()
+        val registry = mapOf("mail__read_email" to meta("mail__read_email", Effect.E0, Disclosure.D2))
+        val events = engine(llm, exec, FakeApprovals(true), audit).run(
+            "bot1", "m", 0.7,
+            BotPolicyProfile("bot1", setOf("mail__read_email")),
+            registry,
+            baseMessages,
+            Session.Task(contract),
+        ).toList()
+        assertEquals(2, llm.seen.size)
+        assertFalse(llm.seen[0].d2Contaminated)
+        assertTrue(llm.seen[1].d2Contaminated)
+        assertEquals(1, exec.calls.size)
+        assertTrue(events.last() is EngineEvent.Done)
     }
 }

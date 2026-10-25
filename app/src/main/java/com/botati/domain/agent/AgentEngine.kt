@@ -82,7 +82,9 @@ class AgentEngine(
             var streamError: String? = null
             var sawToolCalls = false
 
-            llm.stream(LlmRequest(model, messages.toList(), toolSpecs, temperature)).collect { ev ->
+            llm.stream(
+                LlmRequest(model, messages.toList(), toolSpecs, temperature, d2Contaminated),
+            ).collect { ev ->
                 when (ev) {
                     is LlmEvent.TextDelta -> { text.append(ev.text); emit(EngineEvent.TextDelta(ev.text)) }
                     is LlmEvent.ToolDelta -> { sawToolCalls = true; assembler.feed(ev.delta) }
