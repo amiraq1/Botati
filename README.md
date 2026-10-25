@@ -74,7 +74,7 @@ contain `__` themselves.
 
 ### Normal path (Gradle)
 ```
-./gradlew testDebugUnitTest   # 60 unit tests
+./gradlew testDebugUnitTest   # 79 unit tests
 ./gradlew assembleDebug       # → app/build/outputs/apk/debug/app-debug.apk
 ```
 The wrapper is pinned to Gradle 8.10.2 (run `gradle wrapper --gradle-version
@@ -90,7 +90,7 @@ build-tools 35.0.0).
 > `gradle.properties`.
 
 ### What was verified in the VM tonight
-- All 60 unit tests green via standalone kotlinc 2.0.21 + JUnit console
+- All 79 unit tests green via standalone kotlinc 2.0.21 + JUnit console
   (same sources Gradle runs). Evidence in `BUILD_LOG.md`.
 - Full app compiled and packaged with the manual pipeline (aapt2 + kotlinc +
   d8 + apksigner; Room's generated classes hand-written in `manual-room-impl/`
