@@ -69,6 +69,15 @@ class AgentEngineTest {
         }
     }
 
+    private class SequenceApprovals(vararg answers: Boolean) : ApprovalPort {
+        private val responses = ArrayDeque(answers.toList())
+        var asked = 0
+        override suspend fun requestApproval(call: ToolCall, decision: PolicyDecision): Boolean {
+            asked++
+            return if (responses.isEmpty()) false else responses.removeFirst()
+        }
+    }
+
     private class ListAudit : AuditPort {
         val records = mutableListOf<AuditRecord>()
         override fun record(entry: AuditRecord) { records += entry }
@@ -214,6 +223,90 @@ class AgentEngineTest {
         val executed = exec.calls.map { it.name }
         assertTrue("read_file should have been executed", executed.contains("read_file"))
         assertFalse("web_fetch must NOT be executed silently after read_file", executed.contains("web_fetch"))
+    }
+
+    // SEC-02: approving a Pause executes only the pending action; a repeated
+    // identical call still needs its own approval.
+    @Test fun pauseApproval_doesNotGrantFutureIdenticalCalls() = runBlocking {
+        val contract = ScopeContract(
+            taskId = "task1",
+            verb = ContractVerb.REPLY_AND_SEND,
+            allowedTools = listOf("mail__read_email"),
+            targets = ContractTargets(
+                threadIds = listOf("t1"),
+                threadParticipantIds = listOf("alice@x.com"),
+                originalSenderId = "alice@x.com",
+            ),
+            dataDisclosure = DataDisclosureScope.PRIVATE_TO_LLM,
+            recipientsLock = RecipientLock.THREAD_PARTICIPANTS_ONLY,
+            forbidden = listOf(ForbiddenAction.FORWARD, ForbiddenAction.NEW_RECIPIENT),
+            maxSteps = 25,
+            budgetUsd = 0.30,
+            expiresAtMs = null,
+        )
+        val args = """{"threadId":"t1","body":"hello"}"""
+        val llm = FakeLlm(
+            toolScript("mail__save_draft", args),
+            toolScript("mail__save_draft", args),
+            toolScript("mail__save_draft", args),
+            textScript("done"),
+        )
+        val exec = FakeExecutor(); val audit = ListAudit(); val appr = SequenceApprovals(true, false, false)
+        val registry = mapOf("mail__save_draft" to meta("mail__save_draft", Effect.E2, Disclosure.D2))
+        val events = engine(llm, exec, appr, audit).run(
+            "bot1", "m", 0.7,
+            BotPolicyProfile("bot1", setOf("mail__save_draft", "mail__read_email")),
+            registry,
+            baseMessages,
+            Session.Task(contract),
+        ).toList()
+        assertEquals(1, exec.calls.size)
+        assertEquals(listOf("PAUSE", "PAUSE", "PAUSE"), audit.records.map { it.decision })
+        assertEquals(3, events.count { it is EngineEvent.Paused })
+        assertEquals(3, appr.asked)
+        assertTrue(events.last() is EngineEvent.Done)
+    }
+
+    // Owner decision 2026-10-25: irreversible (E3) actions are never granted —
+    // every repeat of an approved send Pauses and asks again.
+    @Test fun e3PauseApproval_neverGrantsRepeat() = runBlocking {
+        val contract = ScopeContract(
+            taskId = "task1",
+            verb = ContractVerb.REPLY_AND_SEND,
+            allowedTools = listOf("mail__read_email"),
+            targets = ContractTargets(
+                threadIds = listOf("t1"),
+                threadParticipantIds = listOf("alice@x.com"),
+                originalSenderId = "alice@x.com",
+            ),
+            dataDisclosure = DataDisclosureScope.PRIVATE_TO_LLM,
+            recipientsLock = RecipientLock.THREAD_PARTICIPANTS_ONLY,
+            forbidden = listOf(ForbiddenAction.FORWARD, ForbiddenAction.NEW_RECIPIENT),
+            maxSteps = 25,
+            budgetUsd = 0.30,
+            expiresAtMs = null,
+        )
+        val args = """{"threadId":"t1","body":"hello"}"""
+        val llm = FakeLlm(
+            toolScript("mail__send_reply", args),
+            toolScript("mail__send_reply", args),
+            toolScript("mail__send_reply", args),
+            textScript("done"),
+        )
+        val exec = FakeExecutor(); val audit = ListAudit(); val appr = FakeApprovals(true)
+        val registry = mapOf("mail__send_reply" to meta("mail__send_reply", Effect.E3, Disclosure.D2))
+        val events = engine(llm, exec, appr, audit).run(
+            "bot1", "m", 0.7,
+            BotPolicyProfile("bot1", setOf("mail__send_reply", "mail__read_email")),
+            registry,
+            baseMessages,
+            Session.Task(contract),
+        ).toList()
+        assertEquals(3, exec.calls.size)
+        assertEquals(listOf("PAUSE", "PAUSE", "PAUSE"), audit.records.map { it.decision })
+        assertEquals(3, events.count { it is EngineEvent.Paused })
+        assertEquals(3, appr.asked)
+        assertTrue(events.last() is EngineEvent.Done)
     }
 
     // §18/Q4: a resumed conversation whose saved history already contains

@@ -14,7 +14,10 @@ import kotlinx.serialization.json.contentOrNull
  * design: scope is checked here, where it can be unit-tested.
  *
  * Precedence (§6.2): Deny → ceiling Stop → out-of-contract Pause →
- * chat tier Ask/Allow → Allow.
+ * chat tier Ask/Allow → Allow. A matching one-shot session grant may override
+ * only its exact Pause reason, never NEW_RECIPIENT or FORBIDDEN_ACTION, and
+ * never an irreversible (E3) action. User approval in AgentEngine applies only
+ * to the pending call; it does not persist as a session grant.
  */
 object PolicyEngine {
 
@@ -44,7 +47,7 @@ object PolicyEngine {
 
         return when (session) {
             is Session.Chat -> decideChat(bot, call, meta, disclosure)
-            is Session.Task -> decideTask(call, meta, disclosure, session.contract, counters, nowMs)
+            is Session.Task -> decideTask(call, meta, disclosure, session.contract, session.grants, counters, nowMs)
         }
     }
 
@@ -81,6 +84,7 @@ object PolicyEngine {
         meta: ToolMeta,
         disclosure: Disclosure,
         contract: ScopeContract,
+        grants: Set<GrantKey>,
         counters: Counters,
         nowMs: Long,
     ): PolicyDecision {
@@ -96,32 +100,60 @@ object PolicyEngine {
             return PolicyDecision.Stop(ReasonCode.CONTRACT_EXPIRED)
         }
 
-        // 3) Contract scope: tool, verb ceiling, forbidden actions, target,
-        //    recipients lock, disclosure scope.
-        if (call.name !in contract.allowedTools) {
-            return PolicyDecision.Pause(ReasonCode.TOOL_NOT_IN_CONTRACT)
-        }
-        if (meta.effect > contract.verb.maxEffect) {
-            return PolicyDecision.Pause(ReasonCode.ACTION_BEYOND_VERB)
-        }
-        forbiddenHit(call, contract)?.let { hit ->
-            return PolicyDecision.Pause(
-                if (hit == ForbiddenAction.NEW_RECIPIENT) ReasonCode.NEW_RECIPIENT
-                else ReasonCode.FORBIDDEN_ACTION,
-            )
-        }
-        if (!targetAllowed(call, contract, meta)) {
-            return PolicyDecision.Pause(ReasonCode.TARGET_MISMATCH)
-        }
-        if (!recipientsAllowed(call, contract)) {
-            return PolicyDecision.Pause(ReasonCode.NEW_RECIPIENT)
-        }
-        if (!disclosureAllowed(disclosure, contract)) {
-            return PolicyDecision.Pause(ReasonCode.DISCLOSURE_NOT_IN_CONTRACT)
+        // 3) Contract scope, evaluated FIRST: a grant may only override the
+        //    exact Pause reason the user was shown — never a forbidden action
+        //    or a new recipient, and never a different payload (SEC-02).
+        val pauseReason = scopePauseReason(call, meta, disclosure, contract)
+        if (pauseReason != null) {
+            // Owner decision 2026-10-25: grants never cover irreversible (E3)
+            // actions — a send or delete is never repeated on a tap, even when
+            // the fingerprint matches. Those always Pause again.
+            if (pauseReason == ReasonCode.NEW_RECIPIENT || pauseReason == ReasonCode.FORBIDDEN_ACTION ||
+                meta.effect == Effect.E3
+            ) {
+                return PolicyDecision.Pause(pauseReason)
+            }
+            if (GrantKey.forCall(call, pauseReason) in grants) {
+                return PolicyDecision.Allow(ReasonCode.GRANTED_ONCE)
+            }
+            return PolicyDecision.Pause(pauseReason)
         }
 
         // 5) Everything checked: execute (the caller writes the audit entry).
         return PolicyDecision.Allow(ReasonCode.IN_CONTRACT)
+    }
+
+    /**
+     * The single scope evaluation (§6.2 step 3). Returns the Pause reason, or
+     * null when the call is inside the contract. Kept as one function so the
+     * grant check and the plain check can never drift apart.
+     */
+    private fun scopePauseReason(
+        call: ToolCall,
+        meta: ToolMeta,
+        disclosure: Disclosure,
+        contract: ScopeContract,
+    ): ReasonCode? {
+        if (call.name !in contract.allowedTools) {
+            return ReasonCode.TOOL_NOT_IN_CONTRACT
+        }
+        if (meta.effect > contract.verb.maxEffect) {
+            return ReasonCode.ACTION_BEYOND_VERB
+        }
+        forbiddenHit(call, contract)?.let { hit ->
+            return if (hit == ForbiddenAction.NEW_RECIPIENT) ReasonCode.NEW_RECIPIENT
+            else ReasonCode.FORBIDDEN_ACTION
+        }
+        if (!targetAllowed(call, contract, meta)) {
+            return ReasonCode.TARGET_MISMATCH
+        }
+        if (!recipientsAllowed(call, contract)) {
+            return ReasonCode.NEW_RECIPIENT
+        }
+        if (!disclosureAllowed(disclosure, contract)) {
+            return ReasonCode.DISCLOSURE_NOT_IN_CONTRACT
+        }
+        return null
     }
 
     // ---- helpers -----------------------------------------------------------

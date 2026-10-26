@@ -19,8 +19,10 @@ private val Context.vaultDataStore by preferencesDataStore(name = "vault")
 /**
  * The Vault (spec §3/§12): secrets are encrypted with Tink AEAD (AES-256-GCM);
  * the keyset is itself wrapped by a master key in the Android Keystore, and
- * only Base64 ciphertext lands in the "vault" DataStore — whose file is
- * excluded from backup by res/xml/data_extraction_rules.xml.
+ * only Base64 ciphertext lands in the "vault" DataStore. Both artifacts — the
+ * ciphertext file and the keyset SharedPreferences — are excluded from backup
+ * and from device-to-device transfer by res/xml/data_extraction_rules.xml
+ * (API 31+) and res/xml/backup_rules.xml (API <= 30).
  *
  * The biometric prompt on the vault screen is a UI gate only; it is NOT what
  * protects these keys (that distinction is deliberate, §0/§3) — the Keystore

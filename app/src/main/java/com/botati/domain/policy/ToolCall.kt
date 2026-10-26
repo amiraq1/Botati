@@ -1,5 +1,6 @@
 package com.botati.domain.policy
 
+import com.botati.domain.security.Sha256
 import kotlinx.serialization.json.JsonObject
 
 enum class TargetKind { NONE, THREAD, FILE, URL }
@@ -20,10 +21,48 @@ data class ToolCall(
     val recipients: List<String> = emptyList(),
 )
 
+/**
+ * An optional one-shot policy grant for one exact (tool, target, arguments,
+ * Pause reason). It is in-memory policy state and is not part of
+ * [ScopeContract]. The interactive approval path executes only the pending
+ * call and does not retain a grant for a later invocation. NEW_RECIPIENT,
+ * FORBIDDEN_ACTION, and irreversible (E3) actions are never grantable.
+ */
+data class GrantKey(
+    val tool: String,
+    val target: String?,
+    /** SHA-256 of the call's raw arguments JSON — a different body is a different action. */
+    val argsDigest: String,
+    /** The exact Pause reason the user approved. */
+    val reason: ReasonCode,
+) {
+    /** True only for the exact call this grant was issued for. */
+    fun matches(call: ToolCall): Boolean =
+        tool == call.name && target == call.target && argsDigest == Sha256.hex(call.arguments.toString())
+
+    companion object {
+        fun forCall(call: ToolCall, reason: ReasonCode): GrantKey =
+            GrantKey(call.name, call.target, Sha256.hex(call.arguments.toString()), reason)
+    }
+}
+
 /** Execution session for a decision: plain chat, or a task under a contract. */
 sealed interface Session {
     data object Chat : Session
-    data class Task(val contract: ScopeContract) : Session
+    data class Task(
+        val contract: ScopeContract,
+        val grants: Set<GrantKey> = emptySet(),
+    ) : Session {
+        fun withGrant(key: GrantKey): Task = copy(grants = grants + key)
+        fun withGrant(call: ToolCall, reason: ReasonCode): Task = withGrant(GrantKey.forCall(call, reason))
+
+        /**
+         * Consumes every grant that would authorize this exact call. At most
+         * one can match: the scope reason for identical input is deterministic.
+         */
+        fun withoutGrantFor(call: ToolCall): Task =
+            copy(grants = grants.filterNot { it.matches(call) }.toSet())
+    }
 }
 
 /** Monotonic counters for the current task (or conversation turn). */

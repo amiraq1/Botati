@@ -74,8 +74,8 @@ class AgentEngine(
             if (messages.none { it.role == "system" }) messages.addAll(0, system)
         }
 
-        val maxSteps = when (session) {
-            is Session.Task -> session.contract.maxSteps
+        val maxSteps = when (val s = session) {
+            is Session.Task -> s.contract.maxSteps
             is Session.Chat -> defaultMaxSteps
         }
         val toolSpecs = registry.values
@@ -212,6 +212,8 @@ class AgentEngine(
                                     messages += toolMessage(assembledCall, result)
                                     emit(EngineEvent.ToolFinished(call, result, true))
                                 } else {
+                                    // Approval applies only to this pending call. Do not
+                                    // persist a grant that could authorize a repeat.
                                     executeAndAppend(call, assembledCall, messages, emitEvent)
                                     if (meta.disclosure == Disclosure.D2) d2Contaminated = true
                                 }
