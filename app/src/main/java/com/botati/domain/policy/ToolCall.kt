@@ -22,15 +22,11 @@ data class ToolCall(
 )
 
 /**
- * One action the user approved while the task was running (§11.3: "the approval
- * adds that action alone to the contract"). One-shot (SEC-02): the grant is
- * bound to the exact (tool, target, arguments digest, Pause reason) the user
- * was shown, lives in memory for the current task run only, and is consumed
- * after the first execution that runs under it — a repeat of the same call
- * Pauses again. It is never persisted and never folded into [ScopeContract],
- * so the approved contract hash keeps describing exactly what was approved
- * up front. NEW_RECIPIENT, FORBIDDEN_ACTION, and any irreversible (E3)
- * action are never grantable.
+ * An optional one-shot policy grant for one exact (tool, target, arguments,
+ * Pause reason). It is in-memory policy state and is not part of
+ * [ScopeContract]. The interactive approval path executes only the pending
+ * call and does not retain a grant for a later invocation. NEW_RECIPIENT,
+ * FORBIDDEN_ACTION, and irreversible (E3) actions are never grantable.
  */
 data class GrantKey(
     val tool: String,

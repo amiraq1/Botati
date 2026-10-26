@@ -3,11 +3,8 @@ package com.botati.domain.agent
 import com.botati.domain.policy.BotPolicyProfile
 import com.botati.domain.policy.Counters
 import com.botati.domain.policy.Disclosure
-import com.botati.domain.policy.Effect
-import com.botati.domain.policy.GrantKey
 import com.botati.domain.policy.PolicyDecision
 import com.botati.domain.policy.PolicyEngine
-import com.botati.domain.policy.ReasonCode
 import com.botati.domain.policy.Session
 import com.botati.domain.policy.TargetKind
 import com.botati.domain.policy.ToolCall
@@ -56,9 +53,6 @@ class AgentEngine(
         var steps = 0
         var consecutiveUnknown = 0
         var finished = false
-        // §11.3: approvals granted mid-run are held here, not written into the
-        // contract, so the approved hash keeps describing what the user saw.
-        var activeSession = session
 
         // Context truncation before the first request (§27).
         val system = messages.filter { it.role == "system" }
@@ -71,7 +65,7 @@ class AgentEngine(
             if (messages.none { it.role == "system" }) messages.addAll(0, system)
         }
 
-        val maxSteps = when (val s = activeSession) {
+        val maxSteps = when (val s = session) {
             is Session.Task -> s.contract.maxSteps
             is Session.Chat -> defaultMaxSteps
         }
@@ -160,7 +154,7 @@ class AgentEngine(
                             costUsedUsd = tracker.totalKnownCostUsd,
                             d2Contaminated = d2Contaminated,
                         )
-                        val decision = PolicyEngine.decide(profile, call, meta, activeSession, counters, nowMs())
+                        val decision = PolicyEngine.decide(profile, call, meta, session, counters, nowMs())
                         audit.record(auditRecord(botId, taskId, call, meta, decisionName(decision), decision))
 
                         when (decision) {
@@ -182,35 +176,14 @@ class AgentEngine(
                                     messages += toolMessage(assembledCall, result)
                                     emit(EngineEvent.ToolFinished(call, result, true))
                                 } else {
-                                    // §11.3/SEC-02: the tap authorizes this action alone,
-                                    // once. The grant is recorded for a later identical
-                                    // call and consumed after the first execution under
-                                    // it; NEW_RECIPIENT and FORBIDDEN_ACTION are never
-                                    // grantable, and neither is any irreversible (E3)
-                                    // action — sends and deletes always Pause again.
-                                    if (decision is PolicyDecision.Pause &&
-                                        decision.reasonCode != ReasonCode.NEW_RECIPIENT &&
-                                        decision.reasonCode != ReasonCode.FORBIDDEN_ACTION &&
-                                        meta.effect != Effect.E3
-                                    ) {
-                                        val s = activeSession
-                                        if (s is Session.Task) {
-                                            activeSession = s.withGrant(GrantKey.forCall(call, decision.reasonCode))
-                                        }
-                                    }
+                                    // Approval applies only to this pending call. Do not
+                                    // persist a grant that could authorize a repeat.
                                     executeAndAppend(call, assembledCall, messages, emitEvent)
                                     if (meta.disclosure == Disclosure.D2) d2Contaminated = true
                                 }
                             }
                             is PolicyDecision.Allow -> {
                                 executeAndAppend(call, assembledCall, messages, emitEvent)
-                                // SEC-02: a grant is honored once — consume it after
-                                // the first execution that ran under it, so the next
-                                // identical call Pauses again.
-                                if (decision.reasonCode == ReasonCode.GRANTED_ONCE) {
-                                    val s = activeSession
-                                    if (s is Session.Task) activeSession = s.withoutGrantFor(call)
-                                }
                                 if (meta.disclosure == Disclosure.D2) d2Contaminated = true
                             }
                         }
@@ -221,7 +194,7 @@ class AgentEngine(
                         }
                     }
 
-                    if (activeSession is Session.Task && tracker.shouldStopForUnknownCost()) {
+                    if (session is Session.Task && tracker.shouldStopForUnknownCost()) {
                         emit(EngineEvent.Stopped("unknown-cost steps ceiling (§5.5)"))
                         finished = true
                     }

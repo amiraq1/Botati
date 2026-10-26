@@ -67,6 +67,15 @@ class AgentEngineTest {
         }
     }
 
+    private class SequenceApprovals(vararg answers: Boolean) : ApprovalPort {
+        private val responses = ArrayDeque(answers.toList())
+        var asked = 0
+        override suspend fun requestApproval(call: ToolCall, decision: PolicyDecision): Boolean {
+            asked++
+            return if (responses.isEmpty()) false else responses.removeFirst()
+        }
+    }
+
     private class ListAudit : AuditPort {
         val records = mutableListOf<AuditRecord>()
         override fun record(entry: AuditRecord) { records += entry }
@@ -214,10 +223,9 @@ class AgentEngineTest {
         assertFalse("web_fetch must NOT be executed silently after read_file", executed.contains("web_fetch"))
     }
 
-    // SEC-02: a Pause approval grants the exact action once — the approved
-    // execution plus one identical repeat; the second repeat Pauses again.
-    // Grants cover E0–E2 only, so the fixture is a reversible (E2) draft.
-    @Test fun pauseApproval_grantsOneRepeatThenPausesAgain() = runBlocking {
+    // SEC-02: approving a Pause executes only the pending action; a repeated
+    // identical call still needs its own approval.
+    @Test fun pauseApproval_doesNotGrantFutureIdenticalCalls() = runBlocking {
         val contract = ScopeContract(
             taskId = "task1",
             verb = ContractVerb.REPLY_AND_SEND,
@@ -241,7 +249,7 @@ class AgentEngineTest {
             toolScript("mail__save_draft", args),
             textScript("done"),
         )
-        val exec = FakeExecutor(); val audit = ListAudit(); val appr = FakeApprovals(true)
+        val exec = FakeExecutor(); val audit = ListAudit(); val appr = SequenceApprovals(true, false, false)
         val registry = mapOf("mail__save_draft" to meta("mail__save_draft", Effect.E2, Disclosure.D2))
         val events = engine(llm, exec, appr, audit).run(
             "bot1", "m", 0.7,
@@ -250,10 +258,10 @@ class AgentEngineTest {
             baseMessages,
             Session.Task(contract),
         ).toList()
-        assertEquals(3, exec.calls.size)
-        assertEquals(listOf("PAUSE", "ALLOW", "PAUSE"), audit.records.map { it.decision })
-        assertEquals(2, events.count { it is EngineEvent.Paused })
-        assertEquals(2, appr.asked)
+        assertEquals(1, exec.calls.size)
+        assertEquals(listOf("PAUSE", "PAUSE", "PAUSE"), audit.records.map { it.decision })
+        assertEquals(3, events.count { it is EngineEvent.Paused })
+        assertEquals(3, appr.asked)
         assertTrue(events.last() is EngineEvent.Done)
     }
 

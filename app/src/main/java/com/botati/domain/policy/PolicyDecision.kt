@@ -19,21 +19,19 @@ enum class ReasonCode {
     ACTION_BEYOND_VERB,
 
     /**
-     * The call is outside the contract but the user approved this exact
-     * (tool, target, arguments, Pause reason) during the run (§11.3/SEC-02).
-     * One-shot: the grant is consumed after the first execution under it.
-     * Never covers irreversible (E3) actions. Not a contract change: the
-     * grant lives in memory for this task only.
+     * The call is outside the contract but matched a one-shot session grant
+     * for this exact (tool, target, arguments, Pause reason). This is distinct
+     * from a UI approval, which authorizes only the pending call and is not
+     * persisted for a later invocation.
      */
     GRANTED_ONCE,
 }
 
 /**
  * The five distinct decisions (§6.2). They are NOT folded into one another:
- * Pause (task, out of contract) adds the approved action to the *session's*
- * one-action grants for one execution only — the approved contract itself
- * is never mutated, so its hash keeps meaning what the user saw; Ask (chat) is a
- * one-off consent; Stop ends the task on a ceiling.
+ * Pause (task, out of contract) asks for approval of the pending call; the
+ * engine executes only that call if approved. Ask (chat) is a one-off consent;
+ * Stop ends the task on a ceiling.
  */
 sealed class PolicyDecision {
     abstract val reasonCode: ReasonCode

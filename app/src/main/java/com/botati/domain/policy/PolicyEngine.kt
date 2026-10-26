@@ -14,10 +14,10 @@ import kotlinx.serialization.json.contentOrNull
  * design: scope is checked here, where it can be unit-tested.
  *
  * Precedence (§6.2): Deny → ceiling Stop → out-of-contract Pause →
- * chat tier Ask/Allow → Allow. A Pause approval grants that exact action
- * once (§11.3/SEC-02): the grant overrides only the shown Pause reason,
- * never NEW_RECIPIENT or FORBIDDEN_ACTION, never an irreversible (E3)
- * action, and is consumed after the first execution under it.
+ * chat tier Ask/Allow → Allow. A matching one-shot session grant may override
+ * only its exact Pause reason, never NEW_RECIPIENT or FORBIDDEN_ACTION, and
+ * never an irreversible (E3) action. User approval in AgentEngine applies only
+ * to the pending call; it does not persist as a session grant.
  */
 object PolicyEngine {
 
