@@ -52,6 +52,7 @@ class BotatiApp : Application() {
                 CrashReporter.breadcrumb("seed_start")
                 val repo = get<BotRepository>()
                 repo.seedTemplatesIfEmpty()
+                repo.seedMissingTemplates()
                 CrashReporter.breadcrumb("db_first_access_ok")
                 repo.reconcileOrphanedTasks(processStartMs)
                 CrashReporter.breadcrumb("seed_done")

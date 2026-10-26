@@ -9,6 +9,8 @@ import com.botati.domain.policy.Session
 import com.botati.domain.policy.TargetKind
 import com.botati.domain.policy.ToolCall
 import com.botati.domain.policy.ToolMeta
+import com.botati.domain.policy.isDenyCompatibleFreeModel
+import com.botati.domain.policy.isFreeModel
 import com.botati.domain.security.SecretRedactor
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -54,6 +56,13 @@ class AgentEngine(
         var consecutiveUnknown = 0
         var finished = false
 
+        // §18/Q4: contamination is derived from the FULL saved history, before
+        // truncation — never from the truncated working copy and never reset.
+        // A D2 tool result dropped by truncation must not silently clear the
+        // flag: later turns may still quote it, and a resumed conversation
+        // must stay deny-routed.
+        var d2Contaminated = initialMessages.any { it.isD2ToolResult(registry) }
+
         // Context truncation before the first request (§27).
         val system = messages.filter { it.role == "system" }
         val history = messages.filter { it.role != "system" }.map { ChatTurn(it.role, it.content) }
@@ -73,16 +82,27 @@ class AgentEngine(
             .filter { it.name in profile.allowedTools }
             .map { LlmToolSpec(it.name, it.description, it.inputSchemaJson) }
 
-        var d2Contaminated = messages.any { it.role == "tool" && registry[it.name]?.disclosure == Disclosure.D2 }
-
         while (!finished) {
             currentCoroutineContext().ensureActive()
+            // §18/Q4: a free model cannot continue a D2-contaminated session
+            // unless it is allowlisted as deny-compatible (verified live
+            // 2026-10-26: most free models have no deny-matching endpoint
+            // and fail with "no matching endpoints"). Stop with a clear
+            // reason instead of a generic failure; the user switches the
+            // model and retries.
+            if (d2Contaminated && isFreeModel(model) && !isDenyCompatibleFreeModel(model)) {
+                emit(EngineEvent.Stopped(FREE_MODEL_D2_REASON))
+                finished = true
+                break
+            }
             val assembler = ToolCallDeltaAssembler()
             val text = StringBuilder()
             var streamError: String? = null
             var sawToolCalls = false
 
-            llm.stream(LlmRequest(model, messages.toList(), toolSpecs, temperature)).collect { ev ->
+            llm.stream(
+                LlmRequest(model, messages.toList(), toolSpecs, temperature, d2Contaminated),
+            ).collect { ev ->
                 when (ev) {
                     is LlmEvent.TextDelta -> { text.append(ev.text); emit(EngineEvent.TextDelta(ev.text)) }
                     is LlmEvent.ToolDelta -> { sawToolCalls = true; assembler.feed(ev.delta) }
@@ -157,6 +177,22 @@ class AgentEngine(
                         val decision = PolicyEngine.decide(profile, call, meta, session, counters, nowMs())
                         audit.record(auditRecord(botId, taskId, call, meta, decisionName(decision), decision))
 
+                        // §18/Q4: a D2 tool must never execute on a free model
+                        // unless it is allowlisted as deny-compatible — the
+                        // result would contaminate the session and the next
+                        // request could not be sent. Refuse before asking or
+                        // executing, with a clear reason; the user switches
+                        // the model. (Deny/Stop decisions execute nothing, so
+                        // they need no guard.)
+                        if (meta.disclosure == Disclosure.D2 && isFreeModel(model) &&
+                            !isDenyCompatibleFreeModel(model) &&
+                            decision !is PolicyDecision.Deny && decision !is PolicyDecision.Stop
+                        ) {
+                            emit(EngineEvent.Stopped(FREE_MODEL_D2_REASON))
+                            finished = true
+                            break
+                        }
+
                         when (decision) {
                             is PolicyDecision.Deny -> {
                                 val result = """{"error":"policy_denied","reason":"${decision.reasonCode}"}"""
@@ -221,6 +257,21 @@ class AgentEngine(
         emit(EngineEvent.ToolFinished(call, truncated, truncated.startsWith("{\"error\"")))
     }
 
+    /**
+     * A tool result counts as D2 when the registry classifies its tool D2
+     * (§18: read_file, analyze_file, mail tools, MCP tools). Unknown tools
+     * fail toward deny: a result whose tool is no longer registered (or was
+     * never named) may still carry private content. D1 remote results
+     * (web_search/web_fetch) need no special case: they are D2-elevated only
+     * after contamination, which implies an earlier D2 result in the same
+     * history — and the derivation reads the full history.
+     */
+    private fun LlmMessage.isD2ToolResult(registry: Map<String, ToolMeta>): Boolean {
+        if (role != "tool") return false
+        val toolName = name ?: return true
+        return registry[toolName]?.disclosure == Disclosure.D2 || toolName !in registry
+    }
+
     private fun toolMessage(call: AssembledToolCall, rawResult: String): LlmMessage =
         LlmMessage(
             role = "tool",
@@ -228,6 +279,15 @@ class AgentEngine(
             toolCallId = call.id,
             name = call.name,
         )
+
+    companion object {
+        /**
+         * Shown when a free-model bot cannot continue private (D2) work.
+         * Arabic on purpose: this reason is displayed verbatim in the UI.
+         */
+        const val FREE_MODEL_D2_REASON =
+            "هذا البوت على موديل مجاني ولا يمكنه التعامل مع محتوى خاص (D2). بدّل الموديل إلى موديل مدفوع ثم أعد المحاولة."
+    }
 
     /** Derives the policy-facing target/recipients from raw arguments. */
     fun toToolCall(name: String, args: JsonObject): ToolCall {

@@ -91,4 +91,8 @@ dependencies {
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
+    // MockEngine for OpenRouterClient provider tests (§18/Q4) — Gradle-only;
+    // the standalone kotlinc script cannot compile BuildConfig/Ktor, see
+    // run_unit_tests.sh.
+    testImplementation(libs.ktor.client.mock)
 }
