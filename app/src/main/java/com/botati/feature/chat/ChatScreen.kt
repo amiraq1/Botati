@@ -3,6 +3,7 @@ package com.botati.feature.chat
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -18,6 +19,7 @@ import androidx.compose.material.icons.filled.Create
 import androidx.compose.material.icons.filled.AddCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -39,6 +41,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import org.koin.androidx.compose.koinViewModel
 import org.koin.core.parameter.parametersOf
@@ -114,6 +118,19 @@ fun ChatScreen(
                 modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
+                if (messages.isEmpty() && streaming.isEmpty() && !running) {
+                    item {
+                        Box(
+                            modifier = Modifier.fillParentMaxSize().padding(horizontal = 12.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            EmptyChatState(
+                                botName = bot?.name.orEmpty(),
+                                onSuggestionSelected = { input = it },
+                            )
+                        }
+                    }
+                }
                 items(messages) { m ->
                     when (m.role) {
                         "tool" -> ToolResultCard(m.toolName ?: "tool", m.content)
@@ -158,7 +175,7 @@ fun ChatScreen(
                 } else {
                     IconButton(onClick = {
                         if (input.isNotBlank()) { vm.send(input); input = "" }
-                    }) {
+                    }, enabled = input.isNotBlank()) {
                         Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "إرسال")
                     }
                 }
@@ -240,6 +257,44 @@ fun ChatScreen(
                 OutlinedButton(onClick = { showTaskDialog = false }) { Text("إلغاء") }
             },
         )
+    }
+}
+
+@Composable
+private fun EmptyChatState(
+    botName: String,
+    onSuggestionSelected: (String) -> Unit,
+) {
+    val suggestions = listOf(
+        "اشرح لي فكرة ببساطة",
+        "ساعدني في كتابة رسالة",
+        "لخّص لي النقاط الأساسية",
+    )
+
+    Card(Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = if (botName.isBlank()) "ابدأ محادثة" else "ابدأ محادثة مع $botName",
+                style = MaterialTheme.typography.titleMedium,
+                textAlign = TextAlign.Center,
+            )
+            Text(
+                text = "اكتب سؤالك، أو اختر اقتراحاً لإضافته إلى مربع الكتابة دون إرساله.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            suggestions.forEach { suggestion ->
+                AssistChip(
+                    onClick = { onSuggestionSelected(suggestion) },
+                    label = { Text(suggestion) },
+                )
+            }
+        }
     }
 }
 

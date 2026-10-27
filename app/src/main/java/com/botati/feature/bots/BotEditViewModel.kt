@@ -71,6 +71,21 @@ class BotEditViewModel(
         state.value = transform(state.value)
     }
 
+    fun setProvider(provider: String) {
+        val current = state.value
+        if (provider == current.provider) return
+        val previousDefault = defaultModel(current.provider)
+        val nextModel = if (current.model.isBlank() || current.model == previousDefault) {
+            defaultModel(provider)
+        } else current.model
+        state.value = current.copy(provider = provider, model = nextModel)
+    }
+
+    private fun defaultModel(provider: String): String = when (provider) {
+        "alpme" -> "gpt-6-luna"
+        else -> "google/gemma-4-31b-it:free"
+    }
+
     fun toggleTool(name: String) = update { s ->
         s.copy(allowedTools = if (name in s.allowedTools) s.allowedTools - name else s.allowedTools + name)
     }

@@ -48,6 +48,7 @@ class AgentEngine(
         session: Session,
         taskId: String? = null,
         defaultMaxSteps: Int = 25,
+        provider: String = "openrouter",
     ): Flow<EngineEvent> = flow {
         val emitEvent: suspend (EngineEvent) -> Unit = { e -> emit(e) }
         val messages = initialMessages.toMutableList()
@@ -101,7 +102,7 @@ class AgentEngine(
             var sawToolCalls = false
 
             llm.stream(
-                LlmRequest(model, messages.toList(), toolSpecs, temperature, d2Contaminated),
+                LlmRequest(model, messages.toList(), toolSpecs, temperature, d2Contaminated, provider),
             ).collect { ev ->
                 when (ev) {
                     is LlmEvent.TextDelta -> { text.append(ev.text); emit(EngineEvent.TextDelta(ev.text)) }

@@ -11,6 +11,8 @@ object SecretRedactor {
     private val patterns: List<Regex> = listOf(
         // OpenAI/OpenRouter-style keys: sk-..., sk-or-v1-...
         Regex("""sk-[A-Za-z0-9_\-]{8,}"""),
+        // Alpme live API keys.
+        Regex("""sk_live_[A-Za-z0-9_\-]{8,}"""),
         // Bearer tokens
         Regex("""(?i)Bearer\s+[A-Za-z0-9._\-]{8,}"""),
         // Generic long hex/base64-ish tokens after key-ish labels

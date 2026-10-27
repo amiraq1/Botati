@@ -22,6 +22,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -43,6 +44,8 @@ class OpenRouterClientProviderTest {
     ) {
         var capturedBody: String? = null
         val capturedBodies = mutableListOf<String>()
+        var capturedUrl: String? = null
+        var capturedAuthorization: String? = null
         val engine = MockEngine { request ->
             val text = when (val b = request.body) {
                 is TextContent -> b.text
@@ -51,6 +54,8 @@ class OpenRouterClientProviderTest {
             }
             capturedBody = text
             capturedBodies += text
+            capturedUrl = request.url.toString()
+            capturedAuthorization = request.headers[HttpHeaders.Authorization]
             respond(
                 content = body,
                 status = status,
@@ -62,7 +67,9 @@ class OpenRouterClientProviderTest {
     private fun client(capturing: CapturingEngine): OpenRouterClient {
         val c = OpenRouterClient(
             HttpClient(capturing.engine) {
-                install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true; encodeDefaults = true }) }
+                install(ContentNegotiation) {
+                    json(Json { ignoreUnknownKeys = true; encodeDefaults = true; explicitNulls = false })
+                }
             },
         )
         c.apiKeyProvider = { "test-key" }
@@ -80,12 +87,14 @@ class OpenRouterClientProviderTest {
         client: OpenRouterClient,
         model: String,
         d2Contaminated: Boolean,
+        provider: String = "openrouter",
     ): List<LlmEvent> = runBlocking {
         client.stream(
             LlmRequest(
                 model = model,
                 messages = listOf(LlmMessage("user", "hi")),
                 d2Contaminated = d2Contaminated,
+                provider = provider,
             ),
         ).toList()
     }
@@ -133,6 +142,34 @@ class OpenRouterClientProviderTest {
             ?: error("expected one Error event, got $events")
         assertTrue("402 must be visible, got: ${error.message}", error.message.contains("402"))
         assertTrue(error.message.contains("Insufficient credits"))
+    }
+
+    @Test fun alpme_usesItsEndpointKeyAndOmitsOpenRouterRoutingControls() {
+        val capturing = CapturingEngine()
+        val c = client(capturing).apply { alpmeApiKeyProvider = { "alpme-test-key" } }
+        stream(c, "gpt-6-luna", d2Contaminated = false, provider = "alpme")
+        assertEquals("https://alpme.com/v1/chat/completions", capturing.capturedUrl)
+        assertEquals("Bearer alpme-test-key", capturing.capturedAuthorization)
+        assertFalse(capturing.capturedBody.orEmpty().contains("\"provider\""))
+    }
+
+    @Test fun alpme_d2ContentIsBlockedBeforeNetworkRequest() {
+        val capturing = CapturingEngine()
+        val c = client(capturing).apply { alpmeApiKeyProvider = { "alpme-test-key" } }
+        val events = stream(c, "gpt-6-luna", d2Contaminated = true, provider = "alpme")
+        val error = events.filterIsInstance<LlmEvent.Error>().single()
+        assertTrue(error.message.contains("private tool data was not sent"))
+        assertTrue(capturing.capturedBodies.isEmpty())
+    }
+
+    @Test fun alpme_keyTestUsesOneTokenProbe() {
+        val capturing = CapturingEngine()
+        val c = client(capturing)
+        val result = runBlocking { c.testProviderKey("alpme-test-key", "alpme") }
+        assertTrue(result.success)
+        assertEquals("https://alpme.com/v1/chat/completions", capturing.capturedUrl)
+        assertTrue(capturing.capturedBody.orEmpty().contains("\"max_tokens\":1"))
+        assertFalse(capturing.capturedBody.orEmpty().contains("\"provider\""))
     }
 
     companion object {

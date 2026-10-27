@@ -258,7 +258,7 @@ class ChatViewModel(
                     botId = b.id, model = b.model, temperature = b.temperature,
                     profile = profile, registry = registry,
                     initialMessages = llmMessages, session = session,
-                    taskId = taskId, defaultMaxSteps = defaultSteps,
+                    taskId = taskId, defaultMaxSteps = defaultSteps, provider = b.provider,
                 ).collect { ev -> onEngineEvent(cid, ev, taskId) }
             } catch (e: Exception) {
                 if (e is kotlinx.coroutines.CancellationException) {
@@ -396,7 +396,9 @@ class ChatViewModel(
         viewModelScope.launch {
             val registry = buildRegistry(b)
             val taskId = UUID.randomUUID().toString()
-            val result = proposer.propose(instruction, b.model, taskId, registry.keys.toList())
+            val result = proposer.propose(
+                instruction, b.model, taskId, registry.keys.toList(), provider = b.provider,
+            )
             result.fold(
                 onSuccess = { contract ->
                     val entity = TaskSessionEntity(

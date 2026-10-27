@@ -11,6 +11,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -61,9 +62,23 @@ fun BotEditScreen(
                 value = s.systemPrompt, onValueChange = { vm.update { st -> st.copy(systemPrompt = it) } },
                 label = { Text("System Prompt") }, modifier = Modifier.fillMaxWidth(), minLines = 4,
             )
+            Text("مزوّد الذكاء الاصطناعي", style = MaterialTheme.typography.titleSmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("openrouter" to "OpenRouter", "alpme" to "Alpme").forEach { (id, label) ->
+                    FilterChip(
+                        selected = s.provider == id,
+                        onClick = { vm.setProvider(id) },
+                        label = { Text(label) },
+                    )
+                }
+            }
+            if (s.provider == "alpme") {
+                Text("أضف مفتاح Alpme من تبويب الخزنة المشفّرة.", style = MaterialTheme.typography.bodySmall)
+            }
             OutlinedTextField(
                 value = s.model, onValueChange = { vm.update { st -> st.copy(model = it) } },
-                label = { Text("الموديل (OpenRouter)") }, modifier = Modifier.fillMaxWidth(), singleLine = true,
+                label = { Text("معرّف الموديل (${if (s.provider == "alpme") "Alpme" else "OpenRouter"})") },
+                modifier = Modifier.fillMaxWidth(), singleLine = true,
             )
             Text("الحرارة: ${"%.2f".format(s.temperature)}", style = MaterialTheme.typography.bodySmall)
             Slider(

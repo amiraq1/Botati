@@ -44,6 +44,7 @@ class ContractProposer(private val client: OpenRouterClient) {
         model: String,
         taskId: String,
         candidateTools: List<String>,
+        provider: String = "openrouter",
     ): Result<ScopeContract> {
         val system = """
             You output ONLY a JSON object for a task scope contract. Fields:
@@ -70,7 +71,10 @@ class ContractProposer(private val client: OpenRouterClient) {
                     model = model,
                     messages = listOf(LlmMessage("system", system), LlmMessage("user", user)),
                     temperature = 0.1,
-                    responseFormat = if (attempt == 0) OpenRouterClient.contractResponseFormat() else null,
+                    responseFormat = if (attempt == 0 && provider == "openrouter") {
+                        OpenRouterClient.contractResponseFormat()
+                    } else null,
+                    provider = provider,
                 )
             } catch (e: Exception) {
                 return Result.failure(e)

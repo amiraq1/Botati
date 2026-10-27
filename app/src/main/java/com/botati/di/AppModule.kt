@@ -32,6 +32,7 @@ val appModule = module {
     single {
         OpenRouterClient(get()).apply {
             apiKeyProvider = { get<Vault>().getSecret(Vault.providerSlot("openrouter")) }
+            alpmeApiKeyProvider = { get<Vault>().getSecret(Vault.providerSlot("alpme")) }
         }
     }
     single { ContractProposer(get()) }

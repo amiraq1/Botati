@@ -28,6 +28,8 @@ data class LlmRequest(
      * that may collect it, whatever model is in use.
      */
     val d2Contaminated: Boolean = false,
+    /** Selected OpenAI-compatible provider, used to resolve its Vault key and endpoint. */
+    val provider: String = "openrouter",
 )
 
 sealed interface LlmEvent {

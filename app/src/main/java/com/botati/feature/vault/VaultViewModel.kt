@@ -17,6 +17,7 @@ class VaultViewModel(
 ) : ViewModel() {
 
     val openRouterMasked = MutableStateFlow<String?>(null)
+    val alpmeMasked = MutableStateFlow<String?>(null)
     val searchMasked = MutableStateFlow<String?>(null)
     val searchEndpoint = MutableStateFlow("")
     val status = MutableStateFlow<String?>(null)
@@ -26,6 +27,7 @@ class VaultViewModel(
     fun refresh() {
         viewModelScope.launch {
             openRouterMasked.value = vault.getSecret(Vault.providerSlot("openrouter"))?.let { SecretRedactor.maskForDisplay(it) }
+            alpmeMasked.value = vault.getSecret(Vault.providerSlot("alpme"))?.let { SecretRedactor.maskForDisplay(it) }
             searchMasked.value = vault.getSecret(Vault.SEARCH_KEY_SLOT)?.let { SecretRedactor.maskForDisplay(it) }
             searchEndpoint.value = settings.searchEndpoint.first()
         }
@@ -46,6 +48,32 @@ class VaultViewModel(
             val key = vault.getSecret(Vault.providerSlot("openrouter"))
             val ok = key != null && runCatching { llm.testKey(key) }.getOrElse { false }
             status.value = if (ok) "المفتاح صالح ✓ (GET /models نجح)." else "فشل الاختبار — تحقق من المفتاح أو الشبكة."
+        }
+    }
+
+    fun saveAlpmeKey(key: String) {
+        if (key.isBlank()) return
+        viewModelScope.launch {
+            vault.putSecret(Vault.providerSlot("alpme"), key.trim())
+            refresh()
+            status.value = "حُفظ مفتاح Alpme بالخزنة المشفّرة."
+        }
+    }
+
+    fun testAlpmeKey() {
+        viewModelScope.launch {
+            status.value = "جارٍ اختبار Alpme بطلب قصير…"
+            val key = vault.getSecret(Vault.providerSlot("alpme"))
+            val result = if (key == null) {
+                OpenRouterClient.ProviderTestResult(false, "Alpme API key is not set.")
+            } else {
+                llm.testProviderKey(key, "alpme")
+            }
+            status.value = if (result.success) {
+                "نجح اختبار Alpme؛ الاختبار يرسل طلبًا صغيرًا وقد يستهلك رموزًا قليلة."
+            } else {
+                "فشل اختبار Alpme: ${result.message}"
+            }
         }
     }
 

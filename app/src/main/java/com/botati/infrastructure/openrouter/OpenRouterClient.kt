@@ -52,7 +52,9 @@ object RedactingKtorLogger : Logger {
 }
 
 fun createHttpClient(): HttpClient = HttpClient(CIO) {
-    install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true; encodeDefaults = true }) }
+    install(ContentNegotiation) {
+        json(Json { ignoreUnknownKeys = true; encodeDefaults = true; explicitNulls = false })
+    }
     install(HttpTimeout) {
         requestTimeoutMillis = 120_000
         connectTimeoutMillis = 15_000
@@ -114,7 +116,8 @@ data class ChatRequestDto(
      * explicitly, so no construction site can silently send unconstrained
      * (implicit "allow"). The value comes from [dataCollectionFor].
      */
-    val provider: ProviderDto,
+    val provider: ProviderDto? = null,
+    @SerialName("max_tokens") val maxTokens: Int? = null,
 )
 
 /** OpenRouter routing controls (`provider` object in the request body). */
@@ -176,12 +179,24 @@ class OpenRouterClient(private val http: HttpClient) : LlmPort {
     private val json = Json { ignoreUnknownKeys = true }
 
     var apiKeyProvider: suspend () -> String? = { null }
+    var alpmeApiKeyProvider: suspend () -> String? = { null }
     var baseUrl: String = "https://openrouter.ai/api/v1"
+    var alpmeBaseUrl: String = "https://alpme.com/v1"
 
     override fun stream(request: LlmRequest): Flow<LlmEvent> = flow {
-        val key = apiKeyProvider()
+        val providerId = request.provider.trim().lowercase()
+        val endpoint = endpointFor(providerId)
+        if (endpoint == null) {
+            emit(LlmEvent.Error("Unsupported model provider: ${request.provider}"))
+            return@flow
+        }
+        if (providerId == "alpme" && request.d2Contaminated) {
+            emit(LlmEvent.Error("Alpme is not configured with a no-collection route; private tool data was not sent."))
+            return@flow
+        }
+        val key = apiKeyFor(providerId)
         if (key.isNullOrBlank()) {
-            emit(LlmEvent.Error("OpenRouter API key is not set — add it in the Vault."))
+            emit(LlmEvent.Error("${providerLabel(providerId)} API key is not set — add it in the Vault."))
             return@flow
         }
         val dto = request.toDto(stream = true)
@@ -193,10 +208,12 @@ class OpenRouterClient(private val http: HttpClient) : LlmPort {
             // sees a misleading "Serializer for class 'ClientSSESession' is
             // not found" instead of the provider's real error (hit live
             // 2026-10-21: the account's 402 hid behind exactly that mask).
-            http.preparePost("$baseUrl/chat/completions") {
+            http.preparePost("$endpoint/chat/completions") {
                 header(HttpHeaders.Authorization, "Bearer $key")
-                header("HTTP-Referer", "https://localhost/botati")
-                header("X-Title", "Botati")
+                if (providerId == "openrouter") {
+                    header("HTTP-Referer", "https://localhost/botati")
+                    header("X-Title", "Botati")
+                }
                 contentType(ContentType.Application.Json)
                 setBody(dto)
             }.execute { response ->
@@ -204,7 +221,7 @@ class OpenRouterClient(private val http: HttpClient) : LlmPort {
                     val errBody = runCatching { response.bodyAsText() }.getOrElse { "" }
                     emit(
                         LlmEvent.Error(
-                            "OpenRouter HTTP ${response.status.value}: " +
+                            "${providerLabel(providerId)} HTTP ${response.status.value}: " +
                                 SecretRedactor.redact(errBody).take(400),
                         ),
                     )
@@ -252,29 +269,88 @@ class OpenRouterClient(private val http: HttpClient) : LlmPort {
         messages: List<LlmMessage>,
         temperature: Double = 0.2,
         responseFormat: JsonObject? = null,
+        provider: String = "openrouter",
     ): String {
-        val key = apiKeyProvider() ?: throw IllegalStateException("OpenRouter API key is not set")
-        val dto = LlmRequest(model, messages, emptyList(), temperature).toDto(stream = false)
-            .copy(responseFormat = responseFormat)
-        val resp: ChatResponseDto = http.post("$baseUrl/chat/completions") {
+        val providerId = provider.trim().lowercase()
+        val endpoint = endpointFor(providerId)
+            ?: throw IllegalStateException("Unsupported model provider: $provider")
+        val key = apiKeyFor(providerId)
+            ?: throw IllegalStateException("${providerLabel(providerId)} API key is not set")
+        val dto = LlmRequest(model, messages, emptyList(), temperature, provider = providerId)
+            .toDto(stream = false).copy(responseFormat = responseFormat)
+        val resp: ChatResponseDto = http.post("$endpoint/chat/completions") {
             header(HttpHeaders.Authorization, "Bearer $key")
+            if (providerId == "openrouter") {
+                header("HTTP-Referer", "https://localhost/botati")
+                header("X-Title", "Botati")
+            }
             contentType(ContentType.Application.Json)
             setBody(dto)
         }.body()
-        resp.error?.let { throw IllegalStateException("OpenRouter error: ${SecretRedactor.redact(it.toString())}") }
+        resp.error?.let {
+            throw IllegalStateException("${providerLabel(providerId)} error: ${SecretRedactor.redact(it.toString())}")
+        }
         return resp.choices.firstOrNull()?.message?.content
             ?: throw IllegalStateException("empty completion")
     }
 
     /** Cheap key check: the models endpoint requires a valid key. */
-    suspend fun testKey(key: String): Boolean = try {
-        val resp = http.get("$baseUrl/models") {
-            header(HttpHeaders.Authorization, "Bearer $key")
-        }
-        resp.status.value in 200..299
-    } catch (e: Exception) { false }
+    suspend fun testKey(key: String): Boolean = testProviderKey(key, "openrouter").success
 
-    private fun LlmRequest.toDto(stream: Boolean): ChatRequestDto = ChatRequestDto(
+    data class ProviderTestResult(val success: Boolean, val message: String)
+
+    /** Alpme's public models list does not authenticate; its test uses one output token instead. */
+    suspend fun testProviderKey(key: String, provider: String): ProviderTestResult {
+        val providerId = provider.trim().lowercase()
+        val endpoint = endpointFor(providerId)
+            ?: return ProviderTestResult(false, "Unsupported model provider: $provider")
+        if (key.isBlank()) return ProviderTestResult(false, "API key is empty")
+        return try {
+            val response = if (providerId == "alpme") {
+                val probe = LlmRequest(
+                    model = "gpt-6-luna",
+                    messages = listOf(LlmMessage("user", "Reply with OK.")),
+                    temperature = 0.0,
+                    provider = providerId,
+                ).toDto(stream = false, maxTokens = 1)
+                http.post("$endpoint/chat/completions") {
+                    header(HttpHeaders.Authorization, "Bearer $key")
+                    contentType(ContentType.Application.Json)
+                    setBody(probe)
+                }
+            } else {
+                http.get("$endpoint/models") { header(HttpHeaders.Authorization, "Bearer $key") }
+            }
+            if (response.status.isSuccess()) {
+                ProviderTestResult(true, if (providerId == "alpme") "Alpme test completion succeeded." else "OpenRouter /models succeeded.")
+            } else {
+                val body = runCatching { response.bodyAsText() }.getOrDefault("")
+                ProviderTestResult(
+                    false,
+                    "HTTP ${response.status.value}: ${SecretRedactor.redact(body).take(240)}",
+                )
+            }
+        } catch (e: Exception) {
+            ProviderTestResult(false, SecretRedactor.redact(e.message ?: "network error").take(240))
+        }
+    }
+
+    private fun endpointFor(providerId: String): String? = when (providerId) {
+        "openrouter" -> baseUrl.trimEnd('/')
+        "alpme" -> alpmeBaseUrl.trimEnd('/')
+        else -> null
+    }
+
+    private suspend fun apiKeyFor(providerId: String): String? = when (providerId) {
+        "openrouter" -> apiKeyProvider()
+        "alpme" -> alpmeApiKeyProvider()
+        else -> null
+    }
+
+    private fun providerLabel(providerId: String): String =
+        if (providerId == "alpme") "Alpme" else "OpenRouter"
+
+    private fun LlmRequest.toDto(stream: Boolean, maxTokens: Int? = null): ChatRequestDto = ChatRequestDto(
         model = model,
         messages = messages.map { m ->
             WireMessage(
@@ -300,7 +376,10 @@ class OpenRouterClient(private val http: HttpClient) : LlmPort {
         usage = if (stream) buildJsonObject { put("include", true) } else null,
         // §18/Q4: routing is decided by the pure dataCollectionFor — the
         // decision history lives in its KDoc, not here.
-        provider = ProviderDto(dataCollectionFor(model, d2Contaminated)),
+        provider = if (provider.trim().lowercase() == "openrouter") {
+            ProviderDto(dataCollectionFor(model, d2Contaminated))
+        } else null,
+        maxTokens = maxTokens,
     )
 
     companion object {
