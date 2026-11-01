@@ -137,18 +137,11 @@ class MinimalMcpClient(
             val legacyErrorCode = errorCodeOf(resp)
 
             // Attempt 2: stateless 2026-07-28 discovery. No session, and the
-            // request describes itself via _meta (added by postRpcRaw).
+            // request describes itself via _meta — postRpcRaw adds it, so this
+            // call passes no params of its own rather than duplicating the block.
             sessionId = null
-            val discoverParams = buildJsonObject {
-                putJsonObject("_meta") {
-                    put(META_PROTOCOL_VERSION, STATELESS_PROTOCOL_VERSION)
-                    putJsonObject(META_CLIENT_INFO) {
-                        put("name", CLIENT_NAME); put("version", CLIENT_VERSION)
-                    }
-                }
-            }
             val (resp2, _) = postRpcRaw(
-                "server/discover", discoverParams, id = nextId.getAndIncrement(), stateless = true,
+                "server/discover", JsonObject(emptyMap()), id = nextId.getAndIncrement(), stateless = true,
             )
             val result2 = resp2?.get("result") as? JsonObject
             if (result2 != null) {
@@ -369,7 +362,14 @@ class MinimalMcpClient(
         return parsed to sid
     }
 
-    /** Adds the mandatory `_meta` block to a stateless request's params. */
+    /**
+     * Adds the mandatory `_meta` block to a stateless request's params.
+     *
+     * There is no handshake in this era, so the request itself has to declare
+     * the protocol version, who the client is, AND what it can do — capabilities
+     * are normally negotiated once in `initialize`, and a stateless request has
+     * no earlier moment to do that.
+     */
     private fun withMeta(params: JsonObject): JsonObject = JsonObject(
         params + (
             "_meta" to buildJsonObject {
@@ -377,6 +377,9 @@ class MinimalMcpClient(
                 putJsonObject(META_CLIENT_INFO) {
                     put("name", CLIENT_NAME); put("version", CLIENT_VERSION)
                 }
+                // We consume tool results only; no sampling, elicitation or
+                // roots support is advertised, so the set is empty.
+                putJsonObject(META_CLIENT_CAPABILITIES) {}
             }
             ),
     )
@@ -398,6 +401,7 @@ class MinimalMcpClient(
 
         const val META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion"
         const val META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
+        const val META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities"
 
         /** §5: an MCP call that takes longer than this is a failure, not a wait. */
         const val MCP_REQUEST_TIMEOUT_MS = 30_000L

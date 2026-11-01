@@ -72,12 +72,14 @@ jobs:
             git status --porcelain -- "$SCHEMA_DIR"
           fi
 
-      - name: Upload exported Room schema
-        # The runner's filesystem is discarded when the job ends, so a schema
-        # that is generated but not yet committed would be lost and the warning
-        # above could never be acted on. Upload it so it can be downloaded with
-        # `gh run download <run-id> -n room-schema` and committed.
-        if: always()
+      - name: Upload exported Room schema on failure
+        # Only useful when the guard above FAILED: that means the schema changed
+        # and was not committed, and the runner's filesystem is about to be
+        # discarded. Uploading then lets the change be fetched with
+        # `gh run download <run-id> -n room-schema` and committed verbatim.
+        # On a green build the committed baseline already matches, so there is
+        # nothing to upload and no artifact is produced.
+        if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: room-schema

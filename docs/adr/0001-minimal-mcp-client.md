@@ -70,6 +70,16 @@ also sees `info`.
 `tools/call`) is sent, on every request — not only on `server/discover`.
 Sending them once is a protocol violation, not an optimisation.
 
+`_meta` carries three keys: `io.modelcontextprotocol/protocolVersion`,
+`…/clientInfo`, and `…/clientCapabilities`. Capabilities belong there because
+this era has no `initialize`: a sessionful client negotiates them once at
+handshake time, and a stateless request has no earlier moment to declare them.
+The advertised set is empty on purpose — this client consumes tool results only
+and supports no sampling, elicitation or roots.
+
+`server/discover` passes empty params and relies on the same merge, so the block
+exists in exactly one place.
+
 **4. HTTP status is checked — with exactly one documented exception.**
 
 A non-2xx answer becomes a typed `McpHttpException` carrying the status and a

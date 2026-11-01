@@ -105,6 +105,42 @@ class McpSessionRecoveryTest {
             call.body.contains("io.modelcontextprotocol/protocolVersion"),
         )
         assertTrue(call.body.contains("_meta"))
+        // There is no handshake in this era, so capabilities have to travel on
+        // the request itself. Ported from PR #7 before that branch was closed.
+        assertTrue(
+            "_meta must declare clientCapabilities",
+            call.body.contains("io.modelcontextprotocol/clientCapabilities"),
+        )
+        assertTrue(call.body.contains(MinimalMcpClient.CLIENT_VERSION))
+    }
+
+    @Test
+    fun serverDiscover_alsoSelfDescribes_insteadOfDuplicatingTheBlock() = runBlocking {
+        val recorded = mutableListOf<Recorded>()
+        val engine = MockEngine { request ->
+            val body = bodyText(request)
+            val method = methodOf(body)
+            recorded += Recorded(method, request.headers, body)
+            when (method) {
+                "initialize" -> respond(
+                    """{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}""",
+                    HttpStatusCode.OK, jsonHeaders(),
+                )
+                "server/discover" -> respond(
+                    """{"jsonrpc":"2.0","id":2,"result":{"name":"srv","version":"1"}}""",
+                    HttpStatusCode.OK, jsonHeaders(),
+                )
+                else -> respond("{}", HttpStatusCode.OK, jsonHeaders())
+            }
+        }
+
+        client(engine).connect()
+
+        val discover = recorded.last { it.method == "server/discover" }
+        assertEquals("server/discover", discover.headers["Mcp-Method"])
+        // No `Mcp-Name`: that header is only defined for tools/call.
+        assertEquals(null, discover.headers["Mcp-Name"])
+        assertTrue(discover.body.contains("io.modelcontextprotocol/clientCapabilities"))
     }
 
     @Test
