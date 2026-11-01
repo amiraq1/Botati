@@ -49,27 +49,28 @@ jobs:
       - name: Assemble Debug APK
         run: ./gradlew :app:assembleDebug --stacktrace
 
-      - name: Room schema export is committed (BOT-18)
-        # exportSchema = true writes app/schemas/<db>/<version>.json during KSP.
-        # That file is what a future migration is written and verified against,
-        # so it has to be in the repo.
-        #   - first run: the file is untracked -> warn, with the exact fix.
-        #   - later: the schema CHANGED but was not committed -> fail.
+      - name: Room schema is in sync (BOT-18)
+        # app/schemas/<db>/<version>.json is committed as the baseline a future
+        # migration is written and verified against. After a build, KSP
+        # regenerates the current version (which must match byte-for-byte) and
+        # creates a NEW <version>.json whenever the schema version is bumped.
+        # Either outcome leaves the tree dirty:
+        #   modified  -> the entities changed and the baseline was not updated
+        #   untracked -> a new schema version was generated and not committed
+        # Both mean the committed baseline no longer describes the code, so both
+        # fail. A first-generation warning branch existed only until the
+        # baseline landed; keeping it would silently let `2.json` through.
         run: |
           SCHEMA_DIR=app/schemas/com.botati.data.db.BotatiDatabase
           if [ ! -d "$SCHEMA_DIR" ]; then
-            echo "::warning::no Room schema exported — check room.schemaLocation in app/build.gradle.kts"
-            exit 0
-          fi
-          echo "Exported schemas:"; ls -1 "$SCHEMA_DIR"
-          if [ -n "$(git status --porcelain -- "$SCHEMA_DIR" | grep -v '^??')" ]; then
-            echo "::error::Room schema changed but is not committed — commit app/schemas/ with the entity change"
-            git status --porcelain -- "$SCHEMA_DIR"
+            echo "::error::no schema exported — check exportSchema and room.schemaLocation in app/build.gradle.kts"
             exit 1
           fi
-          if [ -n "$(git status --porcelain -- "$SCHEMA_DIR" | grep '^??')" ]; then
-            echo "::warning::Room schema generated for the first time — commit app/schemas/ so migrations have a baseline"
+          echo "Exported schemas:"; ls -1 "$SCHEMA_DIR"
+          if [ -n "$(git status --porcelain -- "$SCHEMA_DIR")" ]; then
+            echo "::error::Room schema is out of sync (modified, or a new version is untracked) — fetch the 'room-schema' artifact and commit app/schemas/"
             git status --porcelain -- "$SCHEMA_DIR"
+            exit 1
           fi
 
       - name: Upload exported Room schema on failure
