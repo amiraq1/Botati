@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Spec §12/§0: the vault never leaves the device — neither by backup nor by
-     device-to-device transfer.
+<!-- Spec §12/§0: neither the vault nor the private content it protects may
+     leave the device — not by cloud backup and not by device-to-device
+     transfer.
 
      Why this file exists alongside android:allowBackup="false":
      on Android 12+ some OEM devices still migrate app data over D2D even when
@@ -8,22 +9,37 @@
      supported way to exclude specific files from that path. The legacy
      res/xml/backup_rules.xml covers API <= 30, where fullBackupContent is read.
 
-     Two artifacts matter, not one:
+     Artifacts that matter:
        file       datastore/vault.preferences_pb   — Base64 ciphertext slots
        sharedpref botati_vault_keyset_prefs.xml    — the Tink keyset, itself
                                                      wrapped by an Android
                                                      Keystore master key
+       database   botati.db (+ -wal, -shm)         — mail bodies, tool
+                                                     arguments, audit trail
+
      The wrapped keyset is useless without the Keystore key, so backing it up is
      an availability problem (a restored install cannot decrypt anything), not a
      confidentiality leak — but a restored install that silently loses every key
-     is still a defect worth preventing. -->
+     is still a defect worth preventing.
+
+     SEC-01/BOT-08: excluding only the vault was the bug. The vault protects the
+     KEYS; the database holds the CONTENT those keys were protecting. Backing up
+     one without the other copies private mail and the audit trail off the
+     device while leaving the key behind. The -wal/-shm siblings are excluded
+     because an un-checkpointed write-ahead log still contains the same rows. -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="file" path="datastore/vault.preferences_pb" />
         <exclude domain="sharedpref" path="botati_vault_keyset_prefs.xml" />
+        <exclude domain="database" path="botati.db" />
+        <exclude domain="database" path="botati.db-wal" />
+        <exclude domain="database" path="botati.db-shm" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="file" path="datastore/vault.preferences_pb" />
         <exclude domain="sharedpref" path="botati_vault_keyset_prefs.xml" />
+        <exclude domain="database" path="botati.db" />
+        <exclude domain="database" path="botati.db-wal" />
+        <exclude domain="database" path="botati.db-shm" />
     </device-transfer>
 </data-extraction-rules>

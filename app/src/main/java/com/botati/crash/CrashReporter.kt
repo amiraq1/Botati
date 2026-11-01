@@ -3,11 +3,6 @@ package com.botati.crash
 import android.content.Context
 import android.os.Build
 import java.io.File
-import java.io.PrintWriter
-import java.io.StringWriter
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
  * Dependency-free on-device crash reporter (v0.1.1 diagnostic build).
@@ -46,14 +41,13 @@ object CrashReporter {
 
     private val lock = Any()
 
-    fun diagnosticsFile(context: Context): File {
-        val dir: File = try {
-            context.getExternalFilesDir(null) ?: context.filesDir
-        } catch (t: Throwable) {
-            context.filesDir
-        }
-        return File(dir, FILE_NAME)
-    }
+    /**
+     * BOT-17: the diagnostics file lives in internal storage (`filesDir`).
+     * It used to be written to `getExternalFilesDir`, which is readable by any
+     * app holding storage permission on API 26–28 — and stack traces can carry
+     * URLs, request bodies and tokens in exception messages.
+     */
+    fun diagnosticsFile(context: Context): File = File(context.filesDir, FILE_NAME)
 
     /** True only when the diagnostics file contains an actual crash report. */
     fun hasReport(context: Context): Boolean = try {
@@ -101,7 +95,7 @@ object CrashReporter {
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
             try {
-                appendReport(app, FATAL_MARKER, "thread='${thread.name}'", error)
+                appendReport(app, FATAL_MARKER, "uncaught exception", error, thread.name)
             } catch (t: Throwable) {
                 // The handler itself must never throw.
             }
@@ -135,27 +129,32 @@ object CrashReporter {
         }
     }
 
-    private fun appendReport(context: Context, marker: String, title: String, error: Throwable) {
-        val sw = StringWriter()
-        sw.appendLine()
-        sw.appendLine(marker)
-        sw.appendLine("time: ${now()}")
-        sw.appendLine("title: $title")
-        sw.appendLine(
-            "device: ${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE} " +
-                "(SDK ${Build.VERSION.SDK_INT})",
-        )
-        sw.appendLine("--- stack trace ---")
-        error.printStackTrace(PrintWriter(sw))
-        var cause = error.cause
-        var depth = 0
-        while (cause != null && depth < 5) {
-            sw.appendLine("--- caused by ---")
-            cause.printStackTrace(PrintWriter(sw))
-            cause = cause.cause
-            depth++
+    private fun appendReport(
+        context: Context,
+        marker: String,
+        title: String,
+        error: Throwable,
+        threadName: String? = null,
+    ) {
+        // BOT-17: formatting and redaction live in CrashReportText so they can
+        // be unit-tested without a Context; this function only does file I/O.
+        val device = try {
+            "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE} " +
+                "(SDK ${Build.VERSION.SDK_INT})"
+        } catch (t: Throwable) {
+            null
         }
-        appendRaw(context, sw.toString())
+        appendRaw(
+            context,
+            CrashReportText.format(
+                marker = marker,
+                title = title,
+                thread = threadName,
+                device = device,
+                error = error,
+                timestamp = now(),
+            ),
+        )
     }
 
     private fun appendLine(context: Context, line: String) = appendRaw(context, line + "\n")
@@ -171,6 +170,5 @@ object CrashReporter {
         }
     }
 
-    private fun now(): String =
-        SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
+    private fun now(): String = CrashReportText.now()
 }

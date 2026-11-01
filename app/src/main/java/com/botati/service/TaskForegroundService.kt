@@ -10,6 +10,8 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import com.botati.data.db.BotatiDatabase
+import com.botati.domain.agent.TaskStateTransitions
+import com.botati.domain.agent.TaskStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -65,7 +67,7 @@ class TaskForegroundService : Service() {
         heartbeatJob = scope.launch {
             while (true) {
                 val task = db.taskDao().byId(taskId)
-                if (task == null || task.status != "RUNNING") break
+                if (task == null || task.status != TaskStatus.RUNNING.wire) break
                 db.taskDao().heartbeat(taskId, System.currentTimeMillis())
                 delay(30_000)
             }
@@ -79,12 +81,17 @@ class TaskForegroundService : Service() {
         val taskId = currentTaskId
         if (taskId != null) {
             runBlocking(Dispatchers.IO) {
-                db.taskDao().setStatus(
-                    taskId, "INTERRUPTED",
-                    System.currentTimeMillis(),
-                )
+                // BOT-20: `byId(taskId)!!` threw an NPE inside onTimeout when
+                // the row had been deleted — which is exactly when the platform
+                // is already unhappy with us.
+                val existing = db.taskDao().byId(taskId) ?: return@runBlocking
+                // BOT-09: never overwrite a terminal state. The engine may have
+                // finished between the timeout being scheduled and this running.
+                if (existing.status in TaskStateTransitions.TERMINAL_STATES) return@runBlocking
                 db.taskDao().upsert(
-                    db.taskDao().byId(taskId)!!.copy(
+                    existing.copy(
+                        status = TaskStatus.INTERRUPTED.wire,
+                        lastHeartbeatAt = System.currentTimeMillis(),
                         finalReport = "INTERRUPTED: Android 15 dataSync timeout (onTimeout, §22).",
                     ),
                 )

@@ -83,7 +83,10 @@ data class TaskSessionEntity(
     val instruction: String,
     val contractJson: String? = null,
     val contractHash: String? = null,
-    /** PROPOSED | RUNNING | PAUSED_OUT_OF_SCOPE | STOPPED_LIMIT | CANCELLED | INTERRUPTED | DONE | FAILED */
+    /**
+     * One of [com.botati.domain.agent.TaskStatus.wire] — that enum is the
+     * authority. Stored as a string so a downgrade never fails to read a row.
+     */
     val status: String = "PROPOSED",
     val stepsUsed: Int = 0,
     val costUsed: Double = 0.0,

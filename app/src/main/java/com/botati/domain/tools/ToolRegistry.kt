@@ -16,6 +16,9 @@ object ToolRegistry {
     const val WEB_SEARCH = "web_search"
     const val WEB_FETCH = "web_fetch"
 
+    /** Canonical mail tool name; the one whose schema and args are rewritten. */
+    const val SEND_REPLY = "send_reply"
+
     private fun schema(props: String, required: String) =
         """{"type":"object","properties":{$props},"required":[$required]}"""
 
@@ -72,6 +75,10 @@ object ToolRegistry {
      * Model-facing schema for send_reply (§20/§24): threadId + body ONLY.
      * No to/cc/bcc (the server derives recipients from the thread) and no
      * idempotencyKey (derived deterministically in the executor layer).
+     *
+     * This constant is APPLIED by `McpRepository.registryForServers` — it is
+     * not decorative. Before SEC-02 it was referenced only from a test, so the
+     * model saw whatever schema the MCP server declared.
      */
     val SEND_REPLY_MODEL_SCHEMA: String = schema(
         """"threadId":{"type":"string"},"body":{"type":"string"}""",
