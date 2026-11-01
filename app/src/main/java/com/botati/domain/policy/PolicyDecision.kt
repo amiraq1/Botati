@@ -19,6 +19,15 @@ enum class ReasonCode {
     ACTION_BEYOND_VERB,
 
     /**
+     * SEC-01: a remote-API call issued after private (D2) content entered this
+     * task's context. The URL/query is model-written, so an injected
+     * instruction inside a mail body or file can carry that private content
+     * out inside the request. A contract cannot authorize it: it always
+     * Pauses and is never grantable.
+     */
+    EXFIL_RISK,
+
+    /**
      * The call is outside the contract but matched a one-shot session grant
      * for this exact (tool, target, arguments, Pause reason). This is distinct
      * from a UI approval, which authorizes only the pending call and is not

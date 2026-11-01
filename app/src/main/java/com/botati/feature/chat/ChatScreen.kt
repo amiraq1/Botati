@@ -94,7 +94,7 @@ fun ChatScreen(
         },
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
-            if (activeTask != null && activeTask?.status == "RUNNING") {
+            if (activeTask?.status == com.botati.domain.agent.TaskStatus.RUNNING.wire) {
                 Card(
                     Modifier.fillMaxWidth().padding(8.dp),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),

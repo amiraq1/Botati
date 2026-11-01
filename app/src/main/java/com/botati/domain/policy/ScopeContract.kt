@@ -64,9 +64,7 @@ data class ScopeContract(
     val targets: ContractTargets = ContractTargets(),
     val dataDisclosure: DataDisclosureScope = DataDisclosureScope.PUBLIC_ONLY,
     val recipientsLock: RecipientLock = RecipientLock.NONE,
-    val forbidden: List<ForbiddenAction> = listOf(
-        ForbiddenAction.FORWARD, ForbiddenAction.NEW_RECIPIENT, ForbiddenAction.ATTACHMENTS_OUT,
-    ),
+    val forbidden: List<ForbiddenAction> = DEFAULT_FORBIDDEN,
     val maxSteps: Int = 25,
     val budgetUsd: Double = 0.30,
     val expiresAtMs: Long? = null,
@@ -93,10 +91,30 @@ data class ScopeContract(
         if (schemaVersion != 1) add("unsupported schemaVersion $schemaVersion")
         if (taskId.isBlank()) add("taskId blank")
         if (allowedTools.isEmpty()) add("allowedTools empty")
-        if (maxSteps !in 1..200) add("maxSteps out of range")
-        if (budgetUsd <= 0.0 || budgetUsd > 100.0) add("budgetUsd out of range")
+        if (maxSteps !in 1..MAX_STEPS_LIMIT) add("maxSteps out of range 1..$MAX_STEPS_LIMIT")
+        if (budgetUsd <= 0.0 || budgetUsd > MAX_BUDGET_USD) add("budgetUsd out of range")
+        // §19: a discovery placeholder is never a resolved target. It used to
+        // pass this check and then behave as a real thread id for send_reply.
+        val unresolved = (targets.threadIds + targets.fileUris).filter { it.startsWith("auto:") }
+        if (unresolved.isNotEmpty()) add("unresolved placeholder targets: $unresolved")
         if (verb == ContractVerb.REPLY_AND_SEND && targets.threadIds.isEmpty()) {
             add("reply_and_send requires resolved threadIds (§19: no auto:first_match)")
         }
+        if (verb != ContractVerb.READ_ONLY && expiresAtMs == null) {
+            add("a writing contract must carry an expiry (§19)")
+        }
+    }
+
+    companion object {
+        /** Single ceiling shared by the proposer, the validator and the settings UI. */
+        const val MAX_STEPS_LIMIT = 50
+        const val MAX_BUDGET_USD = 5.0
+
+        /** Conservative default applied when the model emits no forbidden list. */
+        val DEFAULT_FORBIDDEN: List<ForbiddenAction> = listOf(
+            ForbiddenAction.FORWARD,
+            ForbiddenAction.NEW_RECIPIENT,
+            ForbiddenAction.ATTACHMENTS_OUT,
+        )
     }
 }

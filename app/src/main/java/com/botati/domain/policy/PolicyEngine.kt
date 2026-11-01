@@ -66,10 +66,19 @@ object PolicyEngine {
         meta.effect >= Effect.E1 ->
             PolicyDecision.Ask(ReasonCode.TIER_ASK)
         // Private data leaving the device asks once per source (§18).
+        // SEC-03: a remote API call and a target-less call both carry a payload
+        // the MODEL writes (query string, body, URL). Consent for one of those
+        // must never become standing consent for the next one — otherwise a
+        // single approval for `web_search` lets every later query in the
+        // session carry private data out with no prompt. Only a call bound to a
+        // concrete, user-visible target can be pre-approved.
         disclosure == Disclosure.D2 -> {
-            val key = "disclose:" + (call.target ?: call.name)
-            if (key in bot.preApprovedDisclosures) PolicyDecision.Allow(ReasonCode.PRE_APPROVED)
-            else PolicyDecision.Ask(ReasonCode.DISCLOSURE_ASK)
+            val key = call.target?.let { "disclose:$it" }
+            if (key != null && meta.source != ToolSource.REMOTE_API && key in bot.preApprovedDisclosures) {
+                PolicyDecision.Allow(ReasonCode.PRE_APPROVED)
+            } else {
+                PolicyDecision.Ask(ReasonCode.DISCLOSURE_ASK)
+            }
         }
         // F-06: web_fetch must not pass silently in chat
         call.name == "web_fetch" ->
@@ -100,6 +109,17 @@ object PolicyEngine {
             return PolicyDecision.Stop(ReasonCode.CONTRACT_EXPIRED)
         }
 
+        // 2b) SEC-01 — exfiltration gate, after the ceilings and BEFORE scope.
+        //    Once private (D2) content is in this task's context, any call to a
+        //    remote API is an outbound channel whose URL/query the model writes.
+        //    A contract that allows web_fetch cannot authorize that: an injected
+        //    instruction inside a mail body can put the private content in the
+        //    query string and the scope check would call it IN_CONTRACT.
+        //    This always asks, and is never grantable.
+        if (counters.d2Contaminated && meta.source == ToolSource.REMOTE_API) {
+            return PolicyDecision.Pause(ReasonCode.EXFIL_RISK)
+        }
+
         // 3) Contract scope, evaluated FIRST: a grant may only override the
         //    exact Pause reason the user was shown — never a forbidden action
         //    or a new recipient, and never a different payload (SEC-02).
@@ -109,7 +129,7 @@ object PolicyEngine {
             // actions — a send or delete is never repeated on a tap, even when
             // the fingerprint matches. Those always Pause again.
             if (pauseReason == ReasonCode.NEW_RECIPIENT || pauseReason == ReasonCode.FORBIDDEN_ACTION ||
-                meta.effect == Effect.E3
+                pauseReason == ReasonCode.EXFIL_RISK || meta.effect == Effect.E3
             ) {
                 return PolicyDecision.Pause(pauseReason)
             }

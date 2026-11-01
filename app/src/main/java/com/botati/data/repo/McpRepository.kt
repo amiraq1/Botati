@@ -78,7 +78,15 @@ class McpRepository(private val db: BotatiDatabase) {
                 disclosure = runCatching { Disclosure.valueOf(t.disclosure) }.getOrDefault(Disclosure.D2),
                 source = ToolSource.MCP,
                 description = t.description,
-                inputSchemaJson = t.schemaJson,
+                // SEC-02: the mail send schema is fixed locally. A server that
+                // declares `to`/`cc`/`bcc`/`idempotencyKey` must not be able to
+                // put them in front of the model — the executor strips them
+                // anyway, but the model should never see a field it may not use.
+                inputSchemaJson = if (t.plainName == ToolRegistry.SEND_REPLY) {
+                    ToolRegistry.SEND_REPLY_MODEL_SCHEMA
+                } else {
+                    t.schemaJson
+                },
             )
         }
     }

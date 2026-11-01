@@ -10,12 +10,17 @@ data class TruncationResult(
     val droppedCount: Int,
 )
 
+/** Result of [ContextTruncation.trimHistory]: a ready-to-send message list. */
+data class TrimResult(
+    val messages: List<LlmMessage>,
+    val droppedGroups: Int,
+)
+
 /**
  * Context management for the MVP (§27): truncation, NOT summarization.
  * Pinned material (system envelope + task instruction + contract summary) is
  * passed separately and always kept; from the history we keep the last
- * [keepLastTurns]. A truncation note is recorded so nobody believes the bot
- * "remembers" what was cut.
+ * [keepLastTurns].
  */
 object ContextTruncation {
     const val DEFAULT_KEEP_LAST_TURNS = 20
@@ -39,6 +44,55 @@ object ContextTruncation {
             dropped++
         }
         return TruncationResult(kept, dropped > 0, dropped)
+    }
+
+    /**
+     * Trims a real message list to the last [keepLastGroups] groups, where a
+     * group is one non-tool message plus every tool result that answers it
+     * (BOT-07).
+     *
+     * Why groups and not individual messages: the OpenAI wire format requires
+     * exactly one `tool` message per `tool_calls` id, immediately after the
+     * assistant message that declared them. The previous implementation kept
+     * every assistant message carrying `tool_calls` while dropping tool
+     * results by content match, producing a request that every compatible
+     * provider rejects with 400 — and because the rows stay in Room, the
+     * conversation was bricked permanently rather than for one turn.
+     *
+     * System messages are always preserved and never counted as groups.
+     */
+    fun trimHistory(
+        messages: List<LlmMessage>,
+        keepLastGroups: Int = DEFAULT_KEEP_LAST_TURNS,
+        charBudget: Int = DEFAULT_TOKEN_BUDGET_CHARS,
+    ): TrimResult {
+        val system = messages.filter { it.role == "system" }
+        val body = messages.filter { it.role != "system" }
+        if (body.isEmpty()) return TrimResult(messages, 0)
+
+        val groups = mutableListOf<MutableList<LlmMessage>>()
+        for (m in body) {
+            // A tool result belongs to the group it answers; anything else
+            // starts a new one. A leading orphan tool message gets its own.
+            if (m.role == "tool" && groups.isNotEmpty()) groups.last() += m
+            else groups += mutableListOf(m)
+        }
+
+        var start = if (groups.size > keepLastGroups) groups.size - keepLastGroups else 0
+        fun keptChars(from: Int): Int {
+            var total = 0
+            for (i in from until groups.size) for (m in groups[i]) total += m.content.length
+            return total
+        }
+        // Enforce the rough char budget from the oldest end, but never drop the
+        // final group: an empty history is not a valid request either.
+        while (groups.size - start > 1 && keptChars(start) > charBudget) start++
+        if (start == 0) return TrimResult(messages, 0)
+
+        val out = ArrayList<LlmMessage>(system.size + groups.size - start)
+        out += system
+        for (i in start until groups.size) out += groups[i]
+        return TrimResult(out, start)
     }
 
     /** Truncates one tool result (§5.4): >~8000 tokens gets cut with a hint. */

@@ -15,17 +15,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Actions are pinned to a full commit SHA, with the release tag in a
+      # trailing comment so Dependabot can bump both. A mutable tag like `@v4`
+      # lets the upstream owner change what CI executes under our name.
+      # SHAs resolved with `git ls-remote <repo> refs/tags/<tag>` on 2026-11-01.
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
         with:
           distribution: 'temurin'
           java-version: '17'
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@0bdd871935719febd78681f197cd39af5b6e16a6 # v4.2.2
 
       - name: Run Unit Tests (Gradle)
         run: ./gradlew :app:testDebugUnitTest --stacktrace
@@ -44,6 +48,29 @@ jobs:
 
       - name: Assemble Debug APK
         run: ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Room schema export is committed (BOT-18)
+        # exportSchema = true writes app/schemas/<db>/<version>.json during KSP.
+        # That file is what a future migration is written and verified against,
+        # so it has to be in the repo.
+        #   - first run: the file is untracked -> warn, with the exact fix.
+        #   - later: the schema CHANGED but was not committed -> fail.
+        run: |
+          SCHEMA_DIR=app/schemas/com.botati.data.db.BotatiDatabase
+          if [ ! -d "$SCHEMA_DIR" ]; then
+            echo "::warning::no Room schema exported — check room.schemaLocation in app/build.gradle.kts"
+            exit 0
+          fi
+          echo "Exported schemas:"; ls -1 "$SCHEMA_DIR"
+          if [ -n "$(git status --porcelain -- "$SCHEMA_DIR" | grep -v '^??')" ]; then
+            echo "::error::Room schema changed but is not committed — commit app/schemas/ with the entity change"
+            git status --porcelain -- "$SCHEMA_DIR"
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain -- "$SCHEMA_DIR" | grep '^??')" ]; then
+            echo "::warning::Room schema generated for the first time — commit app/schemas/ so migrations have a baseline"
+            git status --porcelain -- "$SCHEMA_DIR"
+          fi
 
       - name: Check Signing Secret Availability
         if: github.event_name == 'push'
@@ -73,9 +100,9 @@ jobs:
 
       - name: Upload Signed Release Artifact
         if: env.HAS_SIGNING_KEY == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: botati-0.1.4-release-signed
+          name: botati-0.1.5-release-signed
           path: |
             app/build/outputs/apk/release/app-release.apk
             app/build/outputs/apk/release/app-release.apk.sha256

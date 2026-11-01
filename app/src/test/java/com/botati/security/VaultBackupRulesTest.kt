@@ -74,4 +74,42 @@ class VaultBackupRulesTest {
         assertTrue(text.contains(keysetPrefs))
         assertFalse("legacy file must not carry the new-format root", text.contains("<data-extraction-rules>"))
     }
+
+    // ---------- BOT-08 / SEC-01: the database is private content too ----------
+
+    private val db = """domain="database" path="botati.db""""
+    private val dbWal = """domain="database" path="botati.db-wal""""
+    private val dbShm = """domain="database" path="botati.db-shm""""
+
+    /**
+     * Excluding only the vault left the actual private content — mail bodies,
+     * tool arguments, the audit trail — eligible for backup. The vault protects
+     * the KEYS; the database holds what those keys were protecting.
+     */
+    @Test fun dataExtractionRulesExcludeTheDatabaseFromCloudBackup() {
+        val f = findFile("src/main/res/xml/data_extraction_rules.xml")
+        assumeTrue("rules not found", f != null)
+        val cloud = block(f!!.readText(), "cloud-backup")
+        assertTrue("botati.db must not be cloud-backed-up", cloud.contains(db))
+        assertTrue("an un-checkpointed WAL holds the same rows", cloud.contains(dbWal))
+        assertTrue("the shared-memory file holds the same rows", cloud.contains(dbShm))
+    }
+
+    @Test fun dataExtractionRulesExcludeTheDatabaseFromDeviceTransfer() {
+        val f = findFile("src/main/res/xml/data_extraction_rules.xml")
+        assumeTrue("rules not found", f != null)
+        val transfer = block(f!!.readText(), "device-transfer")
+        assertTrue(transfer.contains(db))
+        assertTrue(transfer.contains(dbWal))
+        assertTrue(transfer.contains(dbShm))
+    }
+
+    @Test fun legacyFullBackupContentExcludesTheDatabase() {
+        val f = findFile("src/main/res/xml/backup_rules.xml")
+        assumeTrue("legacy rules not found", f != null)
+        val text = f!!.readText()
+        assertTrue(text.contains(db))
+        assertTrue(text.contains(dbWal))
+        assertTrue(text.contains(dbShm))
+    }
 }

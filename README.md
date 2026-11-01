@@ -41,19 +41,37 @@ com.botati
 ```
 
 ### Safety invariants (enforced in code, covered by tests)
-- `PolicyEngine.decide()` precedence: **Deny → Stop (ceilings/expiry) → Pause
-  (out of contract) → chat Ask/Allow tiers → Allow**. Five distinct decisions,
-  each audit-logged with a `reasonCode`.
-- Email `send_reply` model schema contains **threadId + body only** — no
-  recipients, no idempotency key. The deterministic key
-  `sha256(taskId+threadId+bodyHash)` is generated in the executor layer.
+- `PolicyEngine.decide()` precedence: **Deny → Stop (ceilings/expiry) → exfil
+  gate → Pause (out of contract) → chat Ask/Allow tiers → Allow**. Five distinct
+  decisions, each audit-logged with a `reasonCode`.
+- **Exfiltration gate (SEC-01):** once private (D2) content is in a task's
+  context, any remote-API call Pauses with `EXFIL_RISK` *before* the scope check.
+  A contract that allows `web_fetch` cannot authorize carrying a mail body out
+  in a model-written URL. It is never grantable.
+- **Chat disclosure consent is per source, and never for a remote call**
+  (SEC-03): approving one disclosure cannot become standing consent for later
+  `web_search` queries.
+- Email `send_reply`: the model-facing schema is forced to **threadId + body
+  only** (`ToolRegistry.SEND_REPLY_MODEL_SCHEMA`), and the executor strips any
+  `to`/`cc`/`bcc`/`recipients`/idempotency field the server's schema exposed.
+  The deterministic key `sha256(runId+threadId+bodyHash)` is generated
+  executor-side.
+- **`SEND_UNKNOWN` (SEC-02):** an irreversible action that fails after dispatch
+  has an unknown outcome. The run stops instead of handing the model an error it
+  would "retry with a tweak".
 - Unknown MCP tools default to **E3/D2** until the user classifies them.
 - Missing `usage.cost` is **never** silently 0: it is estimated from a price
   table or recorded `unknown` (tasks stop after 3 consecutive unknowns).
 - SSE tool-call arguments are assembled fully per index and JSON-validated
-  before any execution; an unparseable call is never executed.
+  before any execution; an unparseable call is never executed. A stream that
+  ends **without `finish_reason`**, or that carries an in-band `error`, is a
+  failure — never a final answer.
 - `tool_not_found` is a structured result that counts as a step; 3 in a row
   stops the loop.
+- Context trimming cuts whole tool-call groups, and every emitted `tool_call` id
+  is given a result, so a persisted history is always a valid wire history.
+- The Room database (`botati.db` + `-wal` + `-shm`) is excluded from cloud
+  backup **and** device-to-device transfer, not just the vault.
 
 ### MCP compatibility (dual-era, spec §21)
 `McpClientPort` isolates the transport. The shipped client
@@ -74,7 +92,7 @@ contain `__` themselves.
 
 ### Normal path (Gradle)
 ```
-./gradlew testDebugUnitTest   # 115 unit tests (110 standalone + 5 MockEngine)
+./gradlew testDebugUnitTest   # full suite, incl. the MockEngine + Android-facing tests
 ./gradlew assembleDebug       # → app/build/outputs/apk/debug/app-debug.apk
 ```
 The wrapper is pinned to Gradle 8.10.2 (run `gradle wrapper --gradle-version

@@ -27,9 +27,11 @@ import com.botati.domain.policy.Session
 import com.botati.domain.policy.ToolCall
 import com.botati.domain.policy.ToolMeta
 import com.botati.domain.policy.ToolSource
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -75,6 +77,15 @@ class AgentEngineTest {
         override suspend fun requestApproval(call: ToolCall, decision: PolicyDecision): Boolean {
             asked++
             return if (responses.isEmpty()) false else responses.removeFirst()
+        }
+    }
+
+    private class ThrowingExecutor(private val failFor: String) : ToolExecutorPort {
+        var calls = 0
+        override suspend fun execute(call: ToolCall): String {
+            calls++
+            if (call.name == failFor) throw IllegalStateException("socket timeout after dispatch")
+            return """{"ok":true}"""
         }
     }
 
@@ -509,5 +520,137 @@ class AgentEngineTest {
         val stopped = events.filterIsInstance<EngineEvent.Stopped>().singleOrNull()
             ?: error("expected a Stopped event, got $events")
         assertEquals(AgentEngine.FREE_MODEL_D2_REASON, stopped.reason)
+    }
+
+    // ---------- BOT-03 / §24: SEND_UNKNOWN ----------
+
+    /**
+     * An irreversible call that fails after dispatch has an UNKNOWN outcome —
+     * the server may well have sent it. Returning an error to the model invites
+     * "retry with a tweak", which is how a duplicate mail happens.
+     */
+    @Test fun sendFailsAfterDispatch_stopsWithSendUnknown_andNeverRetries() = runBlocking {
+        val llm = FakeLlm(
+            toolScript("mail__send_reply", """{"threadId":"t1","body":"hi"}"""),
+            toolScript("mail__send_reply", """{"threadId":"t1","body":"hi "}"""),
+            textScript("done"),
+        )
+        val exec = ThrowingExecutor("mail__send_reply")
+        val registry = mapOf("mail__send_reply" to meta("mail__send_reply", Effect.E3, Disclosure.D2))
+        val events = engine(llm, exec, FakeApprovals(true), ListAudit()).run(
+            "bot1", "m", 0.7, BotPolicyProfile("bot1", setOf("mail__send_reply")), registry,
+            baseMessages, Session.Chat,
+        ).toList()
+        assertEquals("exactly one send attempt", 1, exec.calls)
+        val stopped = events.filterIsInstance<EngineEvent.Stopped>().singleOrNull()
+            ?: error("expected a Stopped event, got $events")
+        assertEquals(AgentEngine.SEND_UNKNOWN_REASON, stopped.reason)
+        // The model is told not to retry, and the run ends before it can.
+        assertTrue(events.any { it is EngineEvent.ToolFinished && it.result.contains("send_unknown") })
+    }
+
+    /** A non-irreversible failure still returns an error and lets the model continue. */
+    @Test fun readFailsAfterDispatch_returnsToolFailed_andContinues() = runBlocking {
+        val llm = FakeLlm(
+            toolScript("web_search", """{"query":"x"}"""),
+            textScript("answer"),
+        )
+        val exec = ThrowingExecutor("web_search")
+        val registry = mapOf("web_search" to meta("web_search", Effect.E0, Disclosure.D1))
+        val events = engine(llm, exec, FakeApprovals(true), ListAudit()).run(
+            "bot1", "m", 0.7, BotPolicyProfile("bot1", setOf("web_search")), registry,
+            baseMessages, Session.Chat,
+        ).toList()
+        assertTrue(events.any { it is EngineEvent.ToolFinished && it.result.contains("tool_failed") })
+        assertTrue(events.none { it is EngineEvent.Stopped })
+        assertTrue(events.last() is EngineEvent.Done)
+    }
+
+    // ---------- BOT-04: a broken stream is never a final answer ----------
+
+    @Test fun streamWithoutFinishReason_isFailure_notFinalAnswer() = runBlocking {
+        val llm = FakeLlm(listOf(LlmEvent.TextDelta("partial answer")))
+        val events = engine(llm, FakeExecutor(), FakeApprovals(true), ListAudit()).run(
+            "bot1", "m", 0.7, BotPolicyProfile("bot1", emptySet()), emptyMap(),
+            baseMessages, Session.Chat,
+        ).toList()
+        assertTrue("expected Failed, got $events", events.any { it is EngineEvent.Failed })
+        assertFalse(events.any { it is EngineEvent.AssistantCompleted })
+    }
+
+    @Test fun midStreamError_isFailure_notFinalAnswer() = runBlocking {
+        val llm = FakeLlm(
+            listOf(LlmEvent.TextDelta("par"), LlmEvent.Error("provider said no")),
+        )
+        val events = engine(llm, FakeExecutor(), FakeApprovals(true), ListAudit()).run(
+            "bot1", "m", 0.7, BotPolicyProfile("bot1", emptySet()), emptyMap(),
+            baseMessages, Session.Chat,
+        ).toList()
+        val failed = events.filterIsInstance<EngineEvent.Failed>().singleOrNull()
+            ?: error("expected Failed, got $events")
+        assertTrue(failed.message.contains("provider said no"))
+        assertFalse(events.any { it is EngineEvent.AssistantCompleted })
+    }
+
+    // ---------- BOT-10: cancellation is control flow, not a tool result ----------
+
+    /**
+     * `catch (e: Exception)` used to swallow `CancellationException` and turn a
+     * stopped run into a `tool_failed` result the model would read as "try
+     * again". Cancellation must propagate and must never appear as a result.
+     */
+    @Test fun cancellationDuringToolExecution_rethrows_andEmitsNoToolFailed() = runBlocking {
+        val events = mutableListOf<EngineEvent>()
+        val started = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val executor = object : ToolExecutorPort {
+            override suspend fun execute(call: ToolCall): String {
+                started.complete(Unit)
+                kotlinx.coroutines.awaitCancellation()
+            }
+        }
+        val registry = mapOf("web_search" to meta("web_search", Effect.E0, Disclosure.D1))
+        val job = launch {
+            engine(FakeLlm(toolScript("web_search", """{"query":"x"}"""), textScript("unused")), executor, FakeApprovals(true), ListAudit())
+                .run(
+                    "bot1", "m", 0.7,
+                    BotPolicyProfile("bot1", setOf("web_search")),
+                    registry, baseMessages, Session.Chat,
+                )
+                .collect { events += it }
+        }
+        started.await()
+        job.cancelAndJoin()
+
+        assertTrue("the executor must have been reached", events.any { it is EngineEvent.ToolStarted })
+        assertTrue(
+            "cancellation must never surface as a tool result, got $events",
+            events.none { it is EngineEvent.ToolFinished },
+        )
+        assertTrue("cancellation is not a failure", events.none { it is EngineEvent.Failed })
+    }
+
+    // ---------- BOT-13: the audit stores a digest, never the payload ----------
+
+    @Test fun auditRecord_hashesArguments_andNeverStoresPlaintext() = runBlocking {
+        val audits = mutableListOf<AuditRecord>()
+        val audit = object : AuditPort {
+            override fun record(entry: AuditRecord) { audits += entry }
+        }
+        val body = "super-secret-email-body-content"
+        val llm = FakeLlm(
+            toolScript("mail__send_reply", """{"threadId":"t1","body":"$body"}"""),
+            textScript("ok"),
+        )
+        val registry = mapOf("mail__send_reply" to meta("mail__send_reply", Effect.E3, Disclosure.D2))
+        engine(llm, FakeExecutor(), FakeApprovals(true), audit).run(
+            "bot1", "m", 0.7, BotPolicyProfile("bot1", setOf("mail__send_reply")), registry,
+            baseMessages, Session.Chat,
+        ).toList()
+
+        assertTrue("expected at least one audit record", audits.isNotEmpty())
+        val digest = audits.first().argsDigest
+        assertFalse("the body must not reach the audit table", digest.contains(body))
+        assertEquals("argsDigest must be a SHA-256 hex digest", 64, digest.length)
+        assertTrue(digest.all { it in '0'..'9' || it in 'a'..'f' })
     }
 }

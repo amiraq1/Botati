@@ -9,6 +9,15 @@ import com.botati.domain.policy.ScopeContract
  * malicious page/email cannot forge the wrapper.
  */
 object SystemPromptBuilder {
+
+    /**
+     * BOT-14: tag detection is case-insensitive and tolerant of whitespace
+     * (`</TOOL_RESULT>`, `</tool_result >`). The previous exact-match replace
+     * let a payload close the wrapper with different casing, after which any
+     * text following it read as a top-level instruction rather than data.
+     */
+    private val TOOL_RESULT_TAG = Regex("""(?i)<\s*/?\s*tool_result\s*/?\s*>""")
+
     fun build(botName: String, botSystemPrompt: String, contract: ScopeContract? = null, taskInstruction: String? = null): String =
         buildString {
             appendLine("[قواعد المنصة — غير قابلة للتجاوز]")
@@ -30,21 +39,25 @@ object SystemPromptBuilder {
             }
         }
 
-    /** Wraps a tool result, escaping any forged closing/opening tags (§10). */
+    /** Wraps a tool result, escaping any forged opening/closing tag (§10). */
     fun wrapToolResult(raw: String): String {
-        val escaped = raw
-            .replace("</tool_result>", "<\\/tool_result>")
-            .replace("<tool_result>", "<tool_result_escaped>")
+        val escaped = raw.replace(TOOL_RESULT_TAG) { match ->
+            if (match.value.contains('/')) "&lt;/tool_result&gt;" else "&lt;tool_result&gt;"
+        }
         return "<tool_result>\n$escaped\n</tool_result>"
     }
 
-    /** Ensures tool result is enclosed in <tool_result> wrapper, without double wrapping (F-14). */
+    /**
+     * Ensures a tool result is enclosed in exactly one <tool_result> wrapper
+     * (F-14), without double wrapping. Content that is already wrapped is
+     * re-escaped, so rows persisted before the case-insensitive fix are
+     * normalised the next time they are sent.
+     */
     fun ensureWrappedToolResult(raw: String): String {
         val trimmed = raw.trim()
-        return if (trimmed.startsWith("<tool_result>") && trimmed.endsWith("</tool_result>")) {
-            raw
-        } else {
-            wrapToolResult(raw)
-        }
+        val wrapped = trimmed.startsWith("<tool_result>") && trimmed.endsWith("</tool_result>")
+        if (!wrapped) return wrapToolResult(raw)
+        val inner = trimmed.removePrefix("<tool_result>").removeSuffix("</tool_result>")
+        return wrapToolResult(inner.trim('\n'))
     }
 }

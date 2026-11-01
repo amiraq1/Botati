@@ -47,18 +47,23 @@ class TaskLifecycleTest {
         assertEquals("FAILED", status)
     }
 
-    // F-04: Cancellation writes STOPPED and never leaves RUNNING
-    @Test fun terminalStatus_cancelled_becomesStopped_neverLeavesRunning() {
+    // F-04: cancellation writes CANCELLED and never leaves RUNNING.
+    // BOT-16: it used to write a "STOPPED" that existed only in the comparator,
+    // while stop() wrote CANCELLED — two writers, two values, one race.
+    @Test fun terminalStatus_cancelled_becomesCancelled_neverLeavesRunning() {
         val status = TaskStateTransitions.resolveTerminalStatus(
             currentStatus = "RUNNING",
             engineEvent = null,
             wasCancelled = true,
         )
-        assertEquals("STOPPED", status)
+        assertEquals("CANCELLED", status)
     }
 
     @Test fun terminalStatus_existingTerminalStates_arePreserved() {
-        for (terminal in listOf("DONE", "STOPPED", "STOPPED_LIMIT", "CANCELLED", "FAILED")) {
+        for (terminal in listOf(
+            "DONE", "STOPPED", "STOPPED_LIMIT", "STOPPED_POLICY", "SEND_UNKNOWN",
+            "CANCELLED", "FAILED", "INTERRUPTED",
+        )) {
             val status = TaskStateTransitions.resolveTerminalStatus(
                 currentStatus = terminal,
                 engineEvent = null,
@@ -66,5 +71,32 @@ class TaskLifecycleTest {
             )
             assertEquals(terminal, status)
         }
+    }
+
+    // BOT-09: onTimeout() writes INTERRUPTED while the engine is still
+    // unwinding; a late DONE must not overwrite it.
+    @Test fun terminalStatus_interrupted_isNotOverwrittenByDone() {
+        val status = TaskStateTransitions.resolveTerminalStatus(
+            currentStatus = "INTERRUPTED",
+            engineEvent = null,
+            wasCancelled = false,
+        )
+        assertEquals("INTERRUPTED", status)
+    }
+
+    // BOT-16: a stop is not always a ceiling.
+    @Test fun stoppedReason_mapsToTheStateItRepresents() {
+        assertEquals("STOPPED_LIMIT", TaskStateTransitions.resolveTerminalStatus(
+            currentStatus = "RUNNING", engineEvent = EngineEvent.Stopped("step ceiling"),
+        ))
+        assertEquals("STOPPED_LIMIT", TaskStateTransitions.resolveTerminalStatus(
+            currentStatus = "RUNNING", engineEvent = EngineEvent.Stopped("ceiling: STEP_CEILING"),
+        ))
+        assertEquals("STOPPED_POLICY", TaskStateTransitions.resolveTerminalStatus(
+            currentStatus = "RUNNING", engineEvent = EngineEvent.Stopped("three consecutive unknown tools"),
+        ))
+        assertEquals("SEND_UNKNOWN", TaskStateTransitions.resolveTerminalStatus(
+            currentStatus = "RUNNING", engineEvent = EngineEvent.Stopped("SEND_UNKNOWN"),
+        ))
     }
 }

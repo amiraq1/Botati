@@ -7,6 +7,7 @@ import com.botati.infrastructure.openrouter.OpenRouterClient
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.respond
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
@@ -63,6 +64,10 @@ class OpenRouterClientProviderTest {
         val c = OpenRouterClient(
             HttpClient(capturing.engine) {
                 install(ContentNegotiation) { json(Json { ignoreUnknownKeys = true; encodeDefaults = true }) }
+                // The client sets a per-request timeout; the plugin must be
+                // installed for that capability to be honoured (and to keep
+                // this fixture identical to createHttpClient()).
+                install(HttpTimeout) { requestTimeoutMillis = 60_000 }
             },
         )
         c.apiKeyProvider = { "test-key" }

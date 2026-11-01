@@ -43,7 +43,12 @@ class AuditViewModel(
 
     fun saveCeilings() {
         viewModelScope.launch {
-            settings.setDefaultMaxSteps(defaultSteps.value.coerceIn(1, 200))
+            // BOT-21: one ceiling for the whole app. The validator used to allow
+            // 1..200 while the contract proposer clamped to 1..50, so a value
+            // the settings screen accepted could never be honoured.
+            settings.setDefaultMaxSteps(
+                defaultSteps.value.coerceIn(1, com.botati.domain.policy.ScopeContract.MAX_STEPS_LIMIT),
+            )
             defaultBudget.value.toDoubleOrNull()?.let { settings.setDefaultBudgetUsd(it.coerceAtLeast(0.0)) }
         }
     }

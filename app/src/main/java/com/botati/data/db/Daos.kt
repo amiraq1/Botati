@@ -123,7 +123,11 @@ interface FileGrantDao {
         FileGrantEntity::class,
     ],
     version = 1,
-    exportSchema = false,
+    // BOT-18: schema export was off and there were no migrations, so the first
+    // schema change would have crashed every existing install on update. The
+    // exported JSON in app/schemas/ is what a MigrationTestHelper test compares
+    // against, and what a real migration is written from.
+    exportSchema = true,
 )
 abstract class BotatiDatabase : RoomDatabase() {
     abstract fun botDao(): BotDao

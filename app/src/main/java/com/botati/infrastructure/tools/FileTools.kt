@@ -2,6 +2,7 @@ package com.botati.infrastructure.tools
 
 import android.content.Context
 import android.net.Uri
+import com.botati.domain.security.BoundedRead
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
@@ -18,9 +19,17 @@ import kotlin.math.ceil
 
 /**
  * Built-in file tools (§9). They assume the Tool Router has ALREADY enforced
- * the SAF grant (§28) — these functions never see an ungranted URI in the app
- * flow. Text extraction: txt/md/csv/json as UTF-8, docx via ZIP+document.xml
+ * the SAF grant (§28) and has already moved the call onto Dispatchers.IO —
+ * these functions never see an ungranted URI in the app flow.
+ *
+ * Text extraction: txt/md/csv/json as UTF-8, docx via ZIP+document.xml
  * (§3: POI is too heavy for Android), PDF via PdfBox-Android.
+ *
+ * BOT-06: every read is BOUNDED BEFORE it is allocated. The old code called
+ * `readBytes()` and only then checked the 8 MB cap, so a large file OOM'd
+ * before the guard could reject it; and `zip.readBytes()` on `document.xml`
+ * had no cap at all, so an 8 MB docx could inflate to gigabytes (zip bomb).
+ *
  * MVP limitation: CSV parsing handles quoted fields on a single line only
  * (no multi-line quoted cells).
  */
@@ -31,9 +40,9 @@ class FileTools(private val context: Context) {
     fun extractText(uriString: String): String {
         val uri = Uri.parse(uriString)
         val name = displayName(uri).lowercase()
-        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            ?: throw IllegalStateException("cannot open file")
-        require(bytes.size <= 8 * 1024 * 1024) { "file too large for MVP extraction (8MB cap)" }
+        val bytes = context.contentResolver.openInputStream(uri)?.use { input ->
+            BoundedRead.read(input, MAX_EXTRACT_BYTES, "file")
+        } ?: throw IllegalStateException("cannot open file")
         return when {
             name.endsWith(".pdf") -> extractPdf(bytes)
             name.endsWith(".docx") -> extractDocx(bytes)
@@ -52,8 +61,12 @@ class FileTools(private val context: Context) {
         return name
     }
 
-    private fun extractPdf(bytes: ByteArray): String {
-        if (!pdfReady) { PDFBoxResourceLoader.init(context); pdfReady = true }
+    /**
+     * PdfBox parsing is CPU-bound and NOT interruptible: a `withTimeout` around
+     * it would not return until the parser finished anyway. The size cap is the
+     * real mitigation, which is why it is enforced before this is called.
+     */
+    private fun extractPdf(bytes: ByteArray): String {        if (!pdfReady) { PDFBoxResourceLoader.init(context); pdfReady = true }
         ByteArrayInputStream(bytes).use { input ->
             PDDocument.load(input).use { doc ->
                 return PDFTextStripper().getText(doc)
@@ -66,7 +79,13 @@ class FileTools(private val context: Context) {
             var entry = zip.nextEntry
             while (entry != null) {
                 if (entry.name == "word/document.xml") {
-                    val xml = String(zip.readBytes(), Charsets.UTF_8)
+                    // The decompressed part is capped independently of the
+                    // archive size: a few KB of deflated zeros expands without
+                    // limit, which is the classic zip bomb.
+                    val xml = String(
+                        BoundedRead.read(zip, MAX_DOCX_XML_BYTES, "docx word/document.xml"),
+                        Charsets.UTF_8,
+                    )
                     return xml
                         .replace("</w:p>", "\n")
                         .replace(Regex("<[^>]+>"), "")
@@ -92,7 +111,7 @@ class FileTools(private val context: Context) {
             put("uri", uri)
             put("totalChars", text.length)
             put("totalChunks", totalChunks)
-            put("chunkIndex", if (length == 0) 0 else offset / length)
+            put("chunkIndex", offset / length)
             put("text", slice)
         }.toString()
     }
@@ -155,6 +174,12 @@ class FileTools(private val context: Context) {
     }
 
     companion object {
+        /** Whole-file cap for any extraction (matches the documented MVP limit). */
+        const val MAX_EXTRACT_BYTES = 8 * 1024 * 1024
+
+        /** Cap on the decompressed docx body — independent of the archive size. */
+        const val MAX_DOCX_XML_BYTES = 20 * 1024 * 1024
+
         /** Minimal single-line CSV parser with quote awareness. */
         internal fun parseCsvLine(line: String): List<String> {
             val out = mutableListOf<String>()

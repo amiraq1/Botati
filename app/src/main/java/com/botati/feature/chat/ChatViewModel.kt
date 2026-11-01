@@ -24,9 +24,7 @@ import com.botati.domain.agent.EngineEvent
 import com.botati.domain.agent.LlmMessage
 import com.botati.domain.agent.SystemPromptBuilder
 import com.botati.domain.agent.TaskStateTransitions
-import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.withContext
+import com.botati.domain.agent.TaskStatus
 import com.botati.domain.policy.BotPolicyProfile
 import com.botati.domain.policy.PolicyDecision
 import com.botati.domain.policy.ReasonCode
@@ -34,6 +32,8 @@ import com.botati.domain.policy.ScopeContract
 import com.botati.domain.policy.Session
 import com.botati.domain.policy.ToolCall
 import com.botati.domain.policy.ToolMeta
+import com.botati.domain.security.SecretRedactor
+import com.botati.domain.security.Sha256
 import com.botati.domain.tools.ToolRegistry
 import com.botati.infrastructure.mcp.McpClientPool
 import com.botati.infrastructure.openrouter.ContractProposer
@@ -46,6 +46,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -53,10 +55,14 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import java.util.UUID
 
 data class PendingApproval(
@@ -114,6 +120,21 @@ class ChatViewModel(
     private var runCost = 0.0
     private var runSteps = 0
 
+    /**
+     * BOT-19: identity of the current engine run. It is the fallback task id
+     * for idempotency keys in chat mode — a constant per bot meant two
+     * genuinely distinct replies with the same body produced the same key and
+     * the second was dropped as a duplicate.
+     */
+    private var runId: String = UUID.randomUUID().toString()
+
+    /**
+     * BOT-16/BOT-09: the last terminal engine event, so the ONE place that
+     * writes a final status can tell FAILED from a ceiling stop from a policy
+     * stop. Previously every Stopped was recorded as STOPPED_LIMIT.
+     */
+    private var terminalEvent: EngineEvent? = null
+
     init {
         viewModelScope.launch {
             if (conversationIdFlow.value == null) {
@@ -121,6 +142,24 @@ class ChatViewModel(
                 val conv = bots.conversationsList(botId).firstOrNull()
                     ?: bots.newConversation(botId, "محادثة")
                 conversationIdFlow.value = conv.id
+            }
+        }
+    }
+
+    // ---- audit -------------------------------------------------------------
+
+    private val auditPort = object : AuditPort {
+        override fun record(entry: AuditRecord) {
+            auditScope.launch {
+                bots.addAudit(
+                    AuditEntryEntity(
+                        taskId = entry.taskId, botId = entry.botId, tool = entry.tool,
+                        target = entry.target, effect = entry.effect, disclosure = entry.disclosure,
+                        decision = entry.decision, reasonCode = entry.reasonCode.name,
+                        argsDigest = entry.argsDigest, resultSummary = entry.resultSummary,
+                        idempotencyKey = entry.idempotencyKey, timestamp = entry.timestampMs,
+                    ),
+                )
             }
         }
     }
@@ -144,11 +183,30 @@ class ChatViewModel(
             )
             val answer = completer.await()
             pendingApproval.value = null
+            // BOT-13: the user's answer is a policy event. Before this the audit
+            // trail recorded "ASK" and then nothing — it could not distinguish
+            // "approved" from "denied" from "never answered".
+            auditPort.record(
+                AuditRecord(
+                    botId = botId,
+                    taskId = activeTask.value?.id,
+                    tool = call.name,
+                    target = call.target,
+                    effect = "-",
+                    disclosure = "-",
+                    decision = if (answer) "USER_APPROVED" else "USER_DENIED",
+                    reasonCode = decision.reasonCode,
+                    argsDigest = Sha256.hex(SecretRedactor.redact(call.arguments.toString())),
+                    timestampMs = System.currentTimeMillis(),
+                ),
+            )
             if (answer && decision is PolicyDecision.Ask &&
                 decision.reasonCode == ReasonCode.DISCLOSURE_ASK
             ) {
-                // F-17: In-memory session consent only
-                sessionApprovedDisclosures.add("disclose:" + (call.target ?: call.name))
+                // F-17: In-memory session consent only. SEC-03: a target-less
+                // call is never stored — the policy engine would not honour it
+                // anyway, and storing it would misrepresent what was granted.
+                call.target?.let { sessionApprovedDisclosures.add("disclose:$it") }
             }
             return answer
         }
@@ -156,22 +214,6 @@ class ChatViewModel(
 
     fun answerApproval(approved: Boolean) {
         pendingApproval.value?.completer?.complete(approved)
-    }
-
-    private val auditPort = object : AuditPort {
-        override fun record(entry: AuditRecord) {
-            auditScope.launch {
-                bots.addAudit(
-                    AuditEntryEntity(
-                        taskId = entry.taskId, botId = entry.botId, tool = entry.tool,
-                        target = entry.target, effect = entry.effect, disclosure = entry.disclosure,
-                        decision = entry.decision, reasonCode = entry.reasonCode.name,
-                        argsDigest = entry.argsDigest, resultSummary = entry.resultSummary,
-                        idempotencyKey = entry.idempotencyKey, timestamp = entry.timestampMs,
-                    ),
-                )
-            }
-        }
     }
 
     // ---- sending -----------------------------------------------------------
@@ -187,19 +229,31 @@ class ChatViewModel(
     }
 
     fun stop() {
-        runJob?.cancel()
+        val job = runJob
+        runJob = null
+        job?.cancel()
         running.value = false
-        val task = activeTask.value
-        if (task != null) {
-            viewModelScope.launch {
-                val updated = task.copy(
-                    status = "CANCELLED",
-                    finalReport = buildReport("أوقفها المستخدم."),
-                )
-                bots.upsertTask(updated)
-                activeTask.value = updated
+        val task = activeTask.value ?: return
+        viewModelScope.launch {
+            // BOT-10: best effort — a server that keeps working on a send is
+            // the case this exists to prevent. Cancelling the coroutine only
+            // ends OUR wait.
+            withContext(NonCancellable) { runCatching { pool.cancelInFlight() } }
+            // BOT-09/BOT-16: read the row, do not trust the in-memory copy, and
+            // never overwrite a terminal state. This is the single writer for
+            // CANCELLED — the `finally` block sees a terminal row and leaves it.
+            val fresh = bots.task(task.id) ?: return@launch
+            if (TaskStatus.parse(fresh.status)?.isTerminal == true) {
                 TaskForegroundService.stop(app)
+                return@launch
             }
+            val updated = fresh.copy(
+                status = TaskStatus.CANCELLED.wire,
+                finalReport = buildReport("أوقفها المستخدم."),
+            )
+            bots.upsertTask(updated)
+            activeTask.value = updated
+            TaskForegroundService.stop(app)
         }
     }
 
@@ -208,7 +262,10 @@ class ChatViewModel(
         streamingText.value = ""
         statusLine.value = null
         toolsUsed.clear(); runCost = 0.0; runSteps = 0
+        terminalEvent = null
+        runId = UUID.randomUUID().toString()
         val taskId = (session as? Session.Task)?.contract?.taskId
+        val currentRunId = runId
 
         runJob = viewModelScope.launch {
             try {
@@ -220,7 +277,9 @@ class ChatViewModel(
                 )
                 val router = ToolRouter(
                     botId = b.id,
-                    taskIdProvider = { activeTask.value?.id },
+                    // BOT-19: a task uses its contract id; a chat run uses the
+                    // per-run id, so two distinct replies never collide.
+                    taskIdProvider = { activeTask.value?.id ?: currentRunId },
                     grantsProvider = {
                         bots.grantUris(b.id) + decodeStringList(b.safTreeUrisJson)
                     },
@@ -229,28 +288,14 @@ class ChatViewModel(
                 )
                 val contract = (session as? Session.Task)?.contract
                 val history = bots.messages(cid)
-                val llmMessages = mutableListOf<LlmMessage>()
-                llmMessages += LlmMessage(
-                    "system",
-                    SystemPromptBuilder.build(b.name, b.systemPrompt, contract, taskInstruction),
+                val llmMessages = buildWireHistory(history)
+                llmMessages.add(
+                    0,
+                    LlmMessage(
+                        "system",
+                        SystemPromptBuilder.build(b.name, b.systemPrompt, contract, taskInstruction),
+                    ),
                 )
-                // Pair persisted tool results with the ids of the preceding
-                // assistant tool calls positionally (wire format requires it).
-                val pendingIds = ArrayDeque<String?>()
-                history.forEach { m ->
-                    val lm = m.toLlm()
-                    if (lm.role == "assistant" && lm.toolCalls.isNotEmpty()) {
-                        pendingIds.clear()
-                        lm.toolCalls.forEach { pendingIds.addLast(it.id) }
-                        llmMessages += lm
-                    } else if (lm.role == "tool") {
-                        val id = if (pendingIds.isEmpty()) null else pendingIds.removeFirst()
-                        val wrapped = SystemPromptBuilder.ensureWrappedToolResult(lm.content)
-                        llmMessages += lm.copy(content = wrapped, toolCallId = id)
-                    } else {
-                        llmMessages += lm
-                    }
-                }
 
                 val defaultSteps = b.maxStepsOverride ?: settings.defaultMaxStepsValue()
                 val engine = AgentEngine(llm, router, approvalPort, auditPort) { System.currentTimeMillis() }
@@ -260,21 +305,82 @@ class ChatViewModel(
                     initialMessages = llmMessages, session = session,
                     taskId = taskId, defaultMaxSteps = defaultSteps,
                 ).collect { ev -> onEngineEvent(cid, ev, taskId) }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                statusLine.value = "توقّف التنفيذ."
+                throw e
             } catch (e: Exception) {
-                if (e is kotlinx.coroutines.CancellationException) {
-                    statusLine.value = "توقّف التنفيذ."
-                } else {
-                    statusLine.value = "خطأ: ${e.message}"
-                }
+                statusLine.value = "خطأ: ${e.message}"
             } finally {
-                // F-04: NonCancellable cleanup ensures status updates and FGS stop execute
+                // F-04: NonCancellable cleanup ensures status updates and FGS stop execute.
+                // The cancelled flag must be read BEFORE entering NonCancellable —
+                // inside it the context is always active.
+                val cancelled = !currentCoroutineContext().isActive
                 withContext(NonCancellable) {
                     running.value = false
                     streamingText.value = ""
-                    finishTaskIfNeeded(wasCancelled = runJob?.isCancelled == true)
+                    finishTaskIfNeeded(wasCancelled = cancelled)
                 }
             }
         }
+    }
+
+    /**
+     * Rebuilds the wire history from persisted rows.
+     *
+     * BOT-07: every `tool_calls` id must have exactly one matching `tool`
+     * message. A row set written by an interrupted run (cancellation, a stop
+     * mid-group, or the old truncation bug) has ids without results, and every
+     * OpenAI-compatible provider rejects that with 400 — permanently, because
+     * the rows stay in the database. Missing results are synthesised here so a
+     * damaged conversation becomes sendable again instead of bricked.
+     */
+    private fun buildWireHistory(history: List<MessageEntity>): MutableList<LlmMessage> {
+        val out = mutableListOf<LlmMessage>()
+        val pendingIds = ArrayDeque<String>()
+
+        fun flushDangling() {
+            while (pendingIds.isNotEmpty()) {
+                out += LlmMessage(
+                    role = "tool",
+                    content = SystemPromptBuilder.wrapToolResult(
+                        buildJsonObject {
+                            put("error", "missing_result")
+                            put("hint", "this tool result was not recorded")
+                        }.toString(),
+                    ),
+                    toolCallId = pendingIds.removeFirst(),
+                )
+            }
+        }
+
+        history.forEach { m ->
+            val lm = m.toLlm()
+            when {
+                lm.role == "assistant" && lm.toolCalls.isNotEmpty() -> {
+                    flushDangling()
+                    // An id-less call is not representable on the wire; give it
+                    // a stable synthetic one.
+                    val normalized = lm.toolCalls.mapIndexed { i, tc ->
+                        tc.copy(id = tc.id ?: "call_${m.id}_$i")
+                    }
+                    normalized.forEach { pendingIds.addLast(it.id!!) }
+                    out += lm.copy(toolCalls = normalized)
+                }
+                lm.role == "tool" -> {
+                    val id = if (pendingIds.isEmpty()) null else pendingIds.removeFirst()
+                    out += lm.copy(
+                        content = SystemPromptBuilder.ensureWrappedToolResult(lm.content),
+                        toolCallId = id,
+                    )
+                }
+                else -> {
+                    flushDangling()
+                    out += lm
+                }
+            }
+        }
+        flushDangling()
+        return out
     }
 
     private suspend fun onEngineEvent(cid: String, ev: EngineEvent, taskId: String?) {
@@ -320,54 +426,59 @@ class ChatViewModel(
             is EngineEvent.Paused ->
                 statusLine.value = "توقّف مؤقت: ${ev.decision.reasonCode} — بانتظار قرارك."
             is EngineEvent.Stopped -> {
+                // BOT-16: remember the outcome; finishTaskIfNeeded is the single
+                // writer of the terminal state and needs to know WHICH stop this
+                // was (ceiling vs policy vs unknown-outcome send).
                 statusLine.value = "توقّفت الحلقة: ${ev.reason}"
-                activeTask.value?.let { t ->
-                    val updated = t.copy(status = "STOPPED_LIMIT", stepsUsed = runSteps, costUsed = runCost)
-                    bots.upsertTask(updated); activeTask.value = updated
-                }
+                terminalEvent = ev
             }
             is EngineEvent.Failed -> {
                 // F-18: Failed writes FAILED and saves error report
                 statusLine.value = "فشل: ${ev.message}"
-                activeTask.value?.let { t ->
-                    val updated = t.copy(
-                        status = "FAILED",
-                        stepsUsed = runSteps,
-                        costUsed = runCost,
-                        finalReport = buildReport("فشلت المهمة: ${ev.message}"),
-                    )
-                    bots.upsertTask(updated)
-                    activeTask.value = updated
-                }
+                terminalEvent = ev
             }
             is EngineEvent.Done -> Unit
         }
     }
 
+    /**
+     * BOT-09: the single writer of a terminal task state. It re-reads the row
+     * from Room because `TaskForegroundService.onTimeout()` may have written
+     * INTERRUPTED while this engine was still unwinding — a stale in-memory
+     * copy must never overwrite that.
+     */
     private suspend fun finishTaskIfNeeded(wasCancelled: Boolean) {
-        val task = activeTask.value ?: return
+        val cached = activeTask.value ?: return
+        val task = bots.task(cached.id) ?: return
+        activeTask.value = task
+
+        if (TaskStatus.parse(task.status)?.isTerminal == true) {
+            TaskForegroundService.stop(app)
+            return
+        }
+
         val finalStatus = TaskStateTransitions.resolveTerminalStatus(
             currentStatus = task.status,
+            engineEvent = terminalEvent,
             wasCancelled = wasCancelled,
         )
-        // F-18 & F-04: Only update if RUNNING or if terminal status needs to be applied
-        if (task.status == "RUNNING" || (wasCancelled && task.status != "STOPPED" && task.status !in TaskStateTransitions.TERMINAL_STATES)) {
-            val reportReason = when (finalStatus) {
-                "FAILED" -> "فشلت المهمة."
-                "STOPPED" -> "توقّفت المهمة (إلغاء)."
-                "STOPPED_LIMIT" -> "توقفت عند الحد الأقصى."
-                else -> "اكتملت."
-            }
-            val updated = task.copy(
-                status = finalStatus,
-                stepsUsed = runSteps,
-                costUsed = runCost,
-                finalReport = buildReport(reportReason),
-            )
-            bots.upsertTask(updated)
-            activeTask.value = updated
+        val reportReason = when (finalStatus) {
+            TaskStatus.FAILED.wire -> "فشلت المهمة."
+            TaskStatus.CANCELLED.wire -> "توقّفت المهمة (إلغاء)."
+            TaskStatus.STOPPED_LIMIT.wire -> "توقفت عند الحد الأقصى."
+            TaskStatus.STOPPED_POLICY.wire -> "توقفت المهمة بحكم السياسة."
+            TaskStatus.SEND_UNKNOWN.wire -> "إرسال بحالة غير معروفة — تحقّق من الهدف قبل أي إعادة."
+            else -> "اكتملت."
         }
-        if (activeTask.value?.status in TaskStateTransitions.TERMINAL_STATES) {
+        val updated = task.copy(
+            status = finalStatus,
+            stepsUsed = runSteps,
+            costUsed = runCost,
+            finalReport = buildReport(reportReason),
+        )
+        bots.upsertTask(updated)
+        activeTask.value = updated
+        if (TaskStatus.parse(updated.status)?.isTerminal == true) {
             TaskForegroundService.stop(app)
         }
     }
@@ -396,7 +507,26 @@ class ChatViewModel(
         viewModelScope.launch {
             val registry = buildRegistry(b)
             val taskId = UUID.randomUUID().toString()
-            val result = proposer.propose(instruction, b.model, taskId, registry.keys.toList())
+            val result = proposer.propose(
+                instruction = instruction,
+                model = b.model,
+                taskId = taskId,
+                candidateTools = registry.keys.toList(),
+                // §26: the proposal is a paid request; it must be accounted for.
+                onUsage = { usage ->
+                    val resolved = com.botati.domain.agent.UsageAccounting.resolve(b.model, usage)
+                    bots.addUsage(
+                        UsageRecordEntity(
+                            botId = b.id, taskId = taskId, model = b.model,
+                            promptTokens = usage.promptTokens,
+                            completionTokens = usage.completionTokens,
+                            costUsd = resolved.costUsd,
+                            costSource = resolved.source.name.lowercase(),
+                            timestamp = now(),
+                        ),
+                    )
+                },
+            )
             result.fold(
                 onSuccess = { contract ->
                     val entity = TaskSessionEntity(
@@ -405,7 +535,7 @@ class ChatViewModel(
                         instruction = instruction,
                         contractJson = json.encodeToString(contract),
                         contractHash = contract.computeHash(),
-                        status = "PROPOSED", lastHeartbeatAt = now(), createdAt = now(),
+                        status = TaskStatus.PROPOSED.wire, lastHeartbeatAt = now(), createdAt = now(),
                     )
                     bots.upsertTask(entity)
                     activeTask.value = entity
@@ -421,14 +551,38 @@ class ChatViewModel(
         val pending = pendingContract.value ?: return
         val b = bot.value ?: return
         val cid = conversationIdFlow.value ?: return
+
+        // BOT-12/§19: the proposal drops some validation errors so the draft
+        // stays reviewable. THIS is the gate that decides, and it runs the full
+        // validator on the object that would actually execute.
+        val errors = pending.contract.validationErrors()
+        if (errors.isNotEmpty()) {
+            pendingContract.value = null
+            val detail = errors.joinToString("; ")
+            statusLine.value = "العقد غير صالح: $detail"
+            viewModelScope.launch {
+                bots.task(pending.taskId)?.let {
+                    bots.upsertTask(
+                        it.copy(
+                            status = TaskStatus.CANCELLED.wire,
+                            finalReport = "عقد غير صالح: $detail",
+                        ),
+                    )
+                }
+                activeTask.value = null
+            }
+            return
+        }
+
         pendingContract.value = null
         viewModelScope.launch {
             val entity = bots.task(pending.taskId)?.copy(
-                status = "RUNNING", lastHeartbeatAt = now(),
+                status = TaskStatus.RUNNING.wire, lastHeartbeatAt = now(),
             ) ?: return@launch
             bots.upsertTask(entity)
             activeTask.value = entity
-            // The approval tap IS the authorization (§11.1) — recorded with hash.
+            // The approval tap IS the authorization (§11.1) — recorded with the
+            // hash of the exact contract that was shown.
             bots.grantApproval(b.id, "contract", contractHash = pending.contract.computeHash(), note = pending.taskId)
             TaskForegroundService.start(app, pending.taskId)
             bots.addMessage(
@@ -446,7 +600,9 @@ class ChatViewModel(
         pendingContract.value = null
         viewModelScope.launch {
             bots.task(pending.taskId)?.let {
-                bots.upsertTask(it.copy(status = "CANCELLED", finalReport = "رفض المستخدم العقد."))
+                bots.upsertTask(
+                    it.copy(status = TaskStatus.CANCELLED.wire, finalReport = "رفض المستخدم العقد."),
+                )
             }
             activeTask.value = null
         }

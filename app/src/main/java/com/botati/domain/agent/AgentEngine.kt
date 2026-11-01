@@ -3,6 +3,7 @@ package com.botati.domain.agent
 import com.botati.domain.policy.BotPolicyProfile
 import com.botati.domain.policy.Counters
 import com.botati.domain.policy.Disclosure
+import com.botati.domain.policy.Effect
 import com.botati.domain.policy.PolicyDecision
 import com.botati.domain.policy.PolicyEngine
 import com.botati.domain.policy.Session
@@ -12,6 +13,8 @@ import com.botati.domain.policy.ToolMeta
 import com.botati.domain.policy.isDenyCompatibleFreeModel
 import com.botati.domain.policy.isFreeModel
 import com.botati.domain.security.SecretRedactor
+import com.botati.domain.security.Sha256
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
@@ -19,7 +22,9 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.put
 
 /**
  * The agent loop (§5): build request (allowed tools only) → stream → assemble
@@ -30,6 +35,16 @@ import kotlinx.serialization.json.contentOrNull
  * Every policy decision is audited with its reasonCode (§28). Unknown tools
  * return a structured `tool_not_found` to the model and count as steps (§25);
  * three in a row stop the loop instead of spinning.
+ *
+ * Invariants this class owns:
+ *  - §24 SEND_UNKNOWN: a failed irreversible (E3) call never returns an error
+ *    the model could "retry with a tweak" — that is how a duplicate mail
+ *    happens. The run stops instead.
+ *  - §5.2: a truncated or mid-stream-error response is a failure, never a
+ *    final answer.
+ *  - §5.6: cancellation propagates; it is never converted into a tool result.
+ *  - §27: history is trimmed by whole tool-call groups, and every emitted
+ *    tool_call id gets a result, so the persisted wire history stays valid.
  */
 class AgentEngine(
     private val llm: LlmPort,
@@ -38,6 +53,9 @@ class AgentEngine(
     private val audit: AuditPort,
     private val nowMs: () -> Long,
 ) {
+    /** Whether the run may continue after one executed call. */
+    private enum class ExecOutcome { OK, SEND_UNKNOWN }
+
     fun run(
         botId: String,
         model: String,
@@ -63,15 +81,15 @@ class AgentEngine(
         // must stay deny-routed.
         var d2Contaminated = initialMessages.any { it.isD2ToolResult(registry) }
 
-        // Context truncation before the first request (§27).
-        val system = messages.filter { it.role == "system" }
-        val history = messages.filter { it.role != "system" }.map { ChatTurn(it.role, it.content) }
-        val trunc = ContextTruncation.truncate(history)
-        if (trunc.wasTruncated) {
-            emit(EngineEvent.ContextTruncated(trunc.droppedCount))
-            val keptContents = trunc.turns.map { it.content }.toSet()
-            messages.retainAll { it.role == "system" || it.content in keptContents || it.toolCalls.isNotEmpty() }
-            if (messages.none { it.role == "system" }) messages.addAll(0, system)
+        // §27/BOT-07: trim by whole groups (an assistant message plus the tool
+        // results answering its tool_calls). Cutting inside a group produces a
+        // history every OpenAI-compatible provider rejects with 400, which used
+        // to brick the conversation permanently because the bad rows are in Room.
+        val trim = ContextTruncation.trimHistory(messages)
+        if (trim.droppedGroups > 0) {
+            emit(EngineEvent.ContextTruncated(trim.droppedGroups))
+            messages.clear()
+            messages.addAll(trim.messages)
         }
 
         val maxSteps = when (val s = session) {
@@ -98,6 +116,7 @@ class AgentEngine(
             val assembler = ToolCallDeltaAssembler()
             val text = StringBuilder()
             var streamError: String? = null
+            var sawFinish = false
             var sawToolCalls = false
 
             llm.stream(
@@ -111,10 +130,25 @@ class AgentEngine(
                         emit(EngineEvent.UsageRecorded(model, ev.usage, resolved))
                     }
                     is LlmEvent.Error -> streamError = ev.message
-                    is LlmEvent.Finished -> Unit
+                    is LlmEvent.Finished -> {
+                        // BOT-04: `finish_reason: "error"` is a failure, not a
+                        // completed turn — the text so far is a fragment.
+                        if (ev.finishReason == "error") {
+                            streamError = "provider reported a stream error"
+                        } else {
+                            sawFinish = true
+                        }
+                    }
                 }
             }
             if (streamError != null) { emit(EngineEvent.Failed(streamError!!)); return@flow }
+            // BOT-04: a stream that ends without a finish_reason was truncated.
+            // Treating the partial text as a final answer silently loses output
+            // and marks the task DONE.
+            if (!sawFinish) {
+                emit(EngineEvent.Failed("stream truncated: the provider closed the response without finish_reason"))
+                return@flow
+            }
 
             if (!sawToolCalls) {
                 val msg = LlmMessage("assistant", text.toString())
@@ -127,17 +161,16 @@ class AgentEngine(
             when (val assembled = assembler.finish()) {
                 is AssemblyResult.Invalid -> {
                     // Never execute unparseable arguments (§5.2): tell the model.
-                    val err = LlmMessage(
-                        "assistant", text.toString(),
-                    )
-                    messages += err
-                    emit(EngineEvent.AssistantCompleted(err))
-                    messages += LlmMessage(
-                        "user",
-                        SystemPromptBuilder.wrapToolResult(
-                            """{"error":"invalid_tool_arguments","detail":"${assembled.error}"}""",
-                        ),
-                    )
+                    // The error goes back wrapped as tool data — it is
+                    // model-visible text and must not outrank the system prompt.
+                    val assistantText = LlmMessage("assistant", text.toString())
+                    messages += assistantText
+                    emit(EngineEvent.AssistantCompleted(assistantText))
+                    val payload = buildJsonObject {
+                        put("error", "invalid_tool_arguments")
+                        put("detail", assembled.error)
+                    }.toString()
+                    messages += LlmMessage("user", SystemPromptBuilder.wrapToolResult(payload))
                     steps++
                     if (steps >= maxSteps) { emit(EngineEvent.Stopped("step ceiling")); finished = true }
                 }
@@ -147,24 +180,41 @@ class AgentEngine(
                     emit(EngineEvent.AssistantCompleted(assistantMsg))
 
                     for (assembledCall in assembled.calls) {
+                        val call = toToolCall(assembledCall.name, assembledCall.arguments)
+                        // §27/BOT-07: once the run is stopping, still give every
+                        // remaining call id a result, so the persisted history
+                        // keeps exactly one tool message per tool_call id.
+                        if (finished) {
+                            val skipped = buildJsonObject {
+                                put("error", "not_executed")
+                                put("hint", "the run stopped before this call")
+                            }.toString()
+                            messages += toolMessage(assembledCall, skipped)
+                            emit(EngineEvent.ToolFinished(call, skipped, true))
+                            continue
+                        }
                         currentCoroutineContext().ensureActive()
                         steps++
-                        val call = toToolCall(assembledCall.name, assembledCall.arguments)
                         val meta = registry[assembledCall.name]
 
                         if (meta == null) {
                             // §25: unknown tool — structured error, counts as a step.
                             consecutiveUnknown++
                             audit.record(auditRecord(botId, taskId, call, null, "tool_not_found", null))
-                            val result = """{"error":"tool_not_found","tool":"${assembledCall.name}","hint":"use only the tools provided"}"""
+                            val result = buildJsonObject {
+                                put("error", "tool_not_found")
+                                put("tool", assembledCall.name)
+                                put("hint", "use only the tools provided")
+                            }.toString()
                             messages += toolMessage(assembledCall, result)
                             emit(EngineEvent.ToolFinished(call, result, true))
                             if (consecutiveUnknown >= 3) {
                                 emit(EngineEvent.Stopped("three consecutive unknown tools"))
                                 finished = true
-                                break
+                            } else if (steps >= maxSteps) {
+                                emit(EngineEvent.Stopped("step ceiling"))
+                                finished = true
                             }
-                            if (steps >= maxSteps) { emit(EngineEvent.Stopped("step ceiling")); finished = true; break }
                             continue
                         }
                         consecutiveUnknown = 0
@@ -190,43 +240,55 @@ class AgentEngine(
                         ) {
                             emit(EngineEvent.Stopped(FREE_MODEL_D2_REASON))
                             finished = true
-                            break
+                            continue
                         }
 
                         when (decision) {
                             is PolicyDecision.Deny -> {
-                                val result = """{"error":"policy_denied","reason":"${decision.reasonCode}"}"""
+                                val result = buildJsonObject {
+                                    put("error", "policy_denied")
+                                    put("reason", decision.reasonCode.name)
+                                }.toString()
                                 messages += toolMessage(assembledCall, result)
                                 emit(EngineEvent.ToolFinished(call, result, true))
                             }
                             is PolicyDecision.Stop -> {
                                 emit(EngineEvent.Stopped("ceiling: ${decision.reasonCode}"))
                                 finished = true
-                                break
+                                continue
                             }
                             is PolicyDecision.Ask, is PolicyDecision.Pause -> {
                                 if (decision is PolicyDecision.Pause) emit(EngineEvent.Paused(call, decision))
                                 val approved = approvals.requestApproval(call, decision)
                                 if (!approved) {
-                                    val result = """{"error":"user_denied"}"""
+                                    val result = buildJsonObject { put("error", "user_denied") }.toString()
                                     messages += toolMessage(assembledCall, result)
                                     emit(EngineEvent.ToolFinished(call, result, true))
                                 } else {
                                     // Approval applies only to this pending call. Do not
                                     // persist a grant that could authorize a repeat.
-                                    executeAndAppend(call, assembledCall, messages, emitEvent)
+                                    val outcome = executeAndAppend(call, meta, assembledCall, messages, emitEvent)
                                     if (meta.disclosure == Disclosure.D2) d2Contaminated = true
+                                    if (outcome == ExecOutcome.SEND_UNKNOWN) {
+                                        emit(EngineEvent.Stopped(SEND_UNKNOWN_REASON))
+                                        finished = true
+                                        continue
+                                    }
                                 }
                             }
                             is PolicyDecision.Allow -> {
-                                executeAndAppend(call, assembledCall, messages, emitEvent)
+                                val outcome = executeAndAppend(call, meta, assembledCall, messages, emitEvent)
                                 if (meta.disclosure == Disclosure.D2) d2Contaminated = true
+                                if (outcome == ExecOutcome.SEND_UNKNOWN) {
+                                    emit(EngineEvent.Stopped(SEND_UNKNOWN_REASON))
+                                    finished = true
+                                    continue
+                                }
                             }
                         }
-                        if (steps >= maxSteps && !finished) {
+                        if (steps >= maxSteps) {
                             emit(EngineEvent.Stopped("step ceiling"))
                             finished = true
-                            break
                         }
                     }
 
@@ -242,19 +304,41 @@ class AgentEngine(
 
     private suspend fun executeAndAppend(
         call: ToolCall,
+        meta: ToolMeta,
         assembledCall: AssembledToolCall,
         messages: MutableList<LlmMessage>,
         emit: suspend (EngineEvent) -> Unit,
-    ) {
+    ): ExecOutcome {
         emit(EngineEvent.ToolStarted(call))
         val raw = try {
             executor.execute(call)
+        } catch (e: CancellationException) {
+            // §5.6: cancellation is control flow, not a tool result.
+            throw e
         } catch (e: Exception) {
-            """{"error":"tool_failed","detail":"${e.message?.replace("\"", "'") ?: "unknown"}"}"""
+            // §24/BOT-03: an irreversible action that failed after dispatch has
+            // an UNKNOWN outcome — the server may well have performed it.
+            // Handing an error back to the model invites "retry with a tweak",
+            // which is precisely how a duplicate send happens. Stop the run and
+            // make the uncertainty visible instead.
+            if (meta.effect == Effect.E3) {
+                val unknown = buildJsonObject {
+                    put("error", "send_unknown")
+                    put("hint", "the action may have been performed; do not retry")
+                }.toString()
+                messages += toolMessage(assembledCall, unknown)
+                emit(EngineEvent.ToolFinished(call, unknown, true))
+                return ExecOutcome.SEND_UNKNOWN
+            }
+            buildJsonObject {
+                put("error", "tool_failed")
+                put("detail", e.message?.take(200) ?: "unknown")
+            }.toString()
         }
         val truncated = ContextTruncation.truncateToolResult(raw)
         messages += toolMessage(assembledCall, truncated)
         emit(EngineEvent.ToolFinished(call, truncated, truncated.startsWith("{\"error\"")))
+        return ExecOutcome.OK
     }
 
     /**
@@ -287,6 +371,9 @@ class AgentEngine(
          */
         const val FREE_MODEL_D2_REASON =
             "هذا البوت على موديل مجاني ولا يمكنه التعامل مع محتوى خاص (D2). بدّل الموديل إلى موديل مدفوع ثم أعد المحاولة."
+
+        /** §24: the run stops; the user must check the target before retrying. */
+        const val SEND_UNKNOWN_REASON = "SEND_UNKNOWN"
     }
 
     /** Derives the policy-facing target/recipients from raw arguments. */
@@ -339,7 +426,10 @@ class AgentEngine(
         decision = decision,
         reasonCode = policyDecision?.reasonCode
             ?: com.botati.domain.policy.ReasonCode.NOT_ALLOWED,
-        argsDigest = SecretRedactor.redact(call.arguments.toString()).take(300),
+        // BOT-13: a DIGEST, not the first 300 characters of the payload. The
+        // old value wrote up to 300 characters of an email body into an
+        // unencrypted Room table and named the column `argsDigest`.
+        argsDigest = Sha256.hex(SecretRedactor.redact(call.arguments.toString())),
         timestampMs = nowMs(),
     )
 }

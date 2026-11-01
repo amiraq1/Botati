@@ -4,6 +4,7 @@ import com.botati.domain.contracts.Resolution
 import com.botati.domain.contracts.TargetResolver
 import com.botati.domain.policy.ContractTargets
 import com.botati.domain.policy.ContractVerb
+import com.botati.domain.policy.ForbiddenAction
 import com.botati.domain.policy.ScopeContract
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -19,6 +20,9 @@ class ScopeContractTest {
         verb = ContractVerb.REPLY_AND_SEND,
         allowedTools = listOf("mail__send_reply"),
         targets = ContractTargets(threadIds = threadIds),
+        // §19: a writing contract must carry an expiry — the validator rejects
+        // one without it, so every fixture that expects to be valid has one.
+        expiresAtMs = 1_000L,
     )
 
     @Test fun hash_isStable_forSameContract() {
@@ -39,6 +43,31 @@ class ScopeContractTest {
     @Test fun replyAndSend_withoutResolvedThreads_failsValidation() {
         val errors = contract(threadIds = emptyList()).validationErrors()
         assertTrue(errors.any { it.contains("threadIds") })
+    }
+
+    // BOT-12: a discovery placeholder is never a resolved target.
+    @Test fun unresolvedAutoPlaceholder_failsValidation() {
+        val errors = contract(threadIds = listOf("auto:first_match")).validationErrors()
+        assertTrue("expected a placeholder error, got $errors", errors.any { it.contains("auto:") })
+    }
+
+    // BOT-12: a contract with no expiry is a permanent authorization.
+    @Test fun writingContract_withoutExpiry_failsValidation() {
+        val errors = contract().copy(expiresAtMs = null).validationErrors()
+        assertTrue("expected an expiry error, got $errors", errors.any { it.contains("expiry") })
+    }
+
+    // BOT-21: one step ceiling for the proposer, the validator and the settings.
+    @Test fun maxSteps_aboveTheSharedLimit_failsValidation() {
+        val errors = contract().copy(maxSteps = ScopeContract.MAX_STEPS_LIMIT + 1).validationErrors()
+        assertTrue(errors.any { it.contains("maxSteps") })
+        assertTrue(contract().copy(maxSteps = ScopeContract.MAX_STEPS_LIMIT).validationErrors().isEmpty())
+    }
+
+    // §11.2: an empty forbidden list must never SHRINK the default set.
+    @Test fun defaultForbidden_keepsAttachmentsOut() {
+        assertTrue(ScopeContract(taskId = "t", verb = ContractVerb.READ_ONLY, allowedTools = listOf("x"))
+            .forbidden.contains(ForbiddenAction.ATTACHMENTS_OUT))
     }
 
     @Test fun validContract_hasNoErrors_andRoundTripsJson() {

