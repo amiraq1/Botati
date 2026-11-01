@@ -89,6 +89,7 @@ jobs:
           retention-days: 7
 
       - name: Check Signing Secret Availability
+        id: signing
         if: github.event_name == 'push'
         env:
           KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
@@ -100,6 +101,25 @@ jobs:
           else
             echo "HAS_SIGNING_KEY=false" >> "$GITHUB_ENV"
           fi
+
+      - name: Fail — a release tag requires signing credentials
+        # A `v*` tag IS a release. If the keystore secret is missing there, the
+        # old workflow skipped both release steps and still reported success:
+        # a green build with no signed APK, which is the worst possible outcome
+        # for a release pipeline. Fail loudly instead of skipping quietly.
+        # Branch pushes stay tolerant on purpose — a fork or a maintainer without
+        # the secret must still be able to run the test suite.
+        if: startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY != 'true'
+        run: |
+          echo "::error::${GITHUB_REF} is a release tag but SIGNING_KEYSTORE_BASE64 is not set — refusing to report a green build that produced no signed APK"
+          exit 1
+
+      - name: Warn — this build produces no signed APK
+        # Not a failure on a branch push, but never silent either: the job is
+        # green, and "green" must not be read as "a signed artifact exists".
+        if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') && env.HAS_SIGNING_KEY != 'true'
+        run: |
+          echo "::warning::SIGNING_KEYSTORE_BASE64 is not set — this run is unsigned. Tag pushes fail instead, so a release can never be silently unsigned."
 
       - name: Assemble & Verify Signed Release APK
         if: env.HAS_SIGNING_KEY == 'true'
@@ -118,7 +138,9 @@ jobs:
         if: env.HAS_SIGNING_KEY == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: botati-0.1.5-release-signed
+          # Derived from the ref, not hardcoded: a hardcoded version silently
+          # mislabels every later release's artifact.
+          name: botati-release-${{ github.ref_name }}
           path: |
             app/build/outputs/apk/release/app-release.apk
             app/build/outputs/apk/release/app-release.apk.sha256
