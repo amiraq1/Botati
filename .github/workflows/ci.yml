@@ -72,6 +72,19 @@ jobs:
             git status --porcelain -- "$SCHEMA_DIR"
           fi
 
+      - name: Upload exported Room schema
+        # The runner's filesystem is discarded when the job ends, so a schema
+        # that is generated but not yet committed would be lost and the warning
+        # above could never be acted on. Upload it so it can be downloaded with
+        # `gh run download <run-id> -n room-schema` and committed.
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: room-schema
+          path: app/schemas/
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Check Signing Secret Availability
         if: github.event_name == 'push'
         env:
